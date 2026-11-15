@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package squad.voice.v1;
+
+option go_package = "squad/voice/v1;voicev1";
+
+// Сигнальное сообщение поверх WebSocket
+message SignalMessage {
+  enum Type {
+    UNKNOWN = 0;
+    JOIN_ROOM = 1;
+    LEAVE_ROOM = 2;
+    SDP_OFFER = 3;
+    SDP_ANSWER = 4;
+    ICE_CANDIDATE = 5;
+    ROOM_STATE = 6;
+    USER_SPEAKING = 7;
+  }
+
+  Type type = 1;
+  string room_id = 2;
+  string user_id = 3;
+  string user_name = 4;
+  string payload = 5; // SDP offer/answer или JSON ICE
+  uint64 timestamp = 6;
+}
+
+// Бинарный аудио-пакет реального времени (Opus RTP)
+message AudioPacket {
+  uint32 sequence = 1;
+  uint32 timestamp = 2;
+  uint32 ssrc = 3;
+  bytes opus_data = 4; // Сжатый аудиопоток 128 kbps (20ms фрейм)
+  bool is_speaking = 5;
+}
+
+// Текущее состояние комнаты
+message RoomState {
+  string room_id = 1;
+  repeated Participant participants = 2;
+  uint32 active_speakers = 3;
+}
+
+message Participant {
+  string id = 1;
+  string name = 2;
+  bool is_muted = 3;
+  bool is_screen_sharing = 4;
+  uint32 ping_ms = 5;
+}
