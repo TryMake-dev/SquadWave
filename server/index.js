@@ -774,6 +774,14 @@ wss.on("connection", (ws, req) => {
           }
           break;
         }
+
+        // Измерение реального динамического пинга (RTT)
+        case "ping": {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "pong", t: msg.t }));
+          }
+          break;
+        }
       }
     } catch (e) {
       console.error("[WS] Ошибка:", e);

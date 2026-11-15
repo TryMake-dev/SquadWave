@@ -449,8 +449,16 @@ export default function App() {
     const ws = new WebSocket(`${WS_BASE}?token=${authToken}`);
     wsRef.current = ws;
 
+    let pingInterval: any = null;
     ws.onopen = () => {
       console.log("[WS] Подключение к SquadWave Gateway успешно");
+      // Немедленный замер реального пинга при подключении
+      ws.send(JSON.stringify({ type: "ping", t: Date.now() }));
+      pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping", t: Date.now() }));
+        }
+      }, 2000);
     };
 
     ws.onmessage = async (event) => {
@@ -460,6 +468,14 @@ export default function App() {
         switch (msg.type) {
           case "init":
             myClientIdRef.current = msg.clientId;
+            break;
+
+          // Динамический замер реального пинга сети (RTT)
+          case "pong":
+            if (msg.t) {
+              const latency = Math.max(1, Date.now() - msg.t);
+              setPing(latency);
+            }
             break;
 
           // Начальное состояние всех голосовых каналов сервера
@@ -681,6 +697,7 @@ export default function App() {
     };
 
     return () => {
+      if (pingInterval) clearInterval(pingInterval);
       ws.close();
     };
   }, [currentUser?.id, authToken]);
@@ -1667,7 +1684,7 @@ export default function App() {
                 <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
                 <span>ГОЛОС ПОДКЛЮЧЕН</span>
               </div>
-              <span style={{ fontFamily: "monospace", fontSize: 12, color: "#bef264", fontWeight: 800 }}>{ping} ms</span>
+              <span style={{ fontFamily: "monospace", fontSize: 12, color: ping < 45 ? "#bef264" : ping < 120 ? "#facc15" : "#ef4444", fontWeight: 800 }}>{ping} ms</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
               <span>{activeVoiceChannel?.name}</span>
@@ -1846,97 +1863,6 @@ export default function App() {
                 </span>
               </div>
             )}
-
-            {/* Выбор микрофона (Input Device Selector) */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 10px",
-                borderRadius: 8,
-                background: "rgba(255, 255, 255, 0.05)",
-                border: "1px solid rgba(255, 255, 255, 0.1)",
-              }}
-              title="Выбор микрофона (Устройство ввода)"
-            >
-              <Mic size={14} color="#bef264" />
-              <select
-                value={selectedAudioDeviceId}
-                onChange={(e) => handleAudioDeviceChange(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "rgba(255, 255, 255, 0.9)",
-                  fontSize: 11,
-                  fontWeight: 600,
-                  outline: "none",
-                  cursor: "pointer",
-                  maxWidth: 150,
-                  textOverflow: "ellipsis",
-                }}
-              >
-                {audioDevices.length === 0 ? (
-                  <option value="" style={{ background: "#0e1017", color: "#fff" }}>Микрофон (По умолчанию)</option>
-                ) : (
-                  audioDevices.map((d, idx) => (
-                    <option key={d.deviceId || idx} value={d.deviceId} style={{ background: "#0e1017", color: "#fff" }}>
-                      {d.label || `Микрофон ${idx + 1}`}
-                    </option>
-                  ))
-                )}
-              </select>
-            </div>
-
-            <button
-              onClick={() => {
-                const next = !rnnoiseActive;
-                setRnnoiseActive(next);
-                rnnoiseActiveRef.current = next;
-                localStorage.setItem("squadwave_rnnoise", String(next));
-                if (neuralProcessorRef.current) {
-                  neuralProcessorRef.current.rnnoiseEnabled = next;
-                }
-              }}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "6px 14px",
-                borderRadius: 8,
-                background: rnnoiseActive ? "rgba(190, 242, 100, 0.15)" : "rgba(255, 255, 255, 0.05)",
-                border: rnnoiseActive ? "1px solid #bef264" : "1px solid rgba(255, 255, 255, 0.1)",
-                color: rnnoiseActive ? "#bef264" : "rgba(255, 255, 255, 0.5)",
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-              title="Нейросетевое шумоподавление RNNoise (Krisp / Nvidia Broadcast)"
-            >
-              <Sparkles size={14} color={rnnoiseActive ? "#bef264" : "rgba(255,255,255,0.4)"} />
-              <span>RNNoise AI: {rnnoiseActive ? "ВКЛ (Krisp / Neural)" : "ВЫКЛ"}</span>
-            </button>
-
-            <button
-              onClick={() => setShowSettingsModal(true)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "6px 12px",
-                borderRadius: 8,
-                background: "rgba(255, 255, 255, 0.05)",
-                border: "1px solid rgba(255, 255, 255, 0.1)",
-                color: "rgba(255, 255, 255, 0.8)",
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-              title="Настройки микрофона и шумоподавления"
-            >
-              <SlidersHorizontal size={14} />
-              <span>Звук</span>
-            </button>
 
             {isInVoice && (
               <button

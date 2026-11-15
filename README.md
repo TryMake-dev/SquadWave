@@ -31,12 +31,12 @@
 
 ```mermaid
 flowchart TD
-    Client1["Клиент 1 (Браузер / PWA)"] <--> |WebSockets (JSON)| Gateway["SquadWave Server (Node.js)"]
-    Client2["Клиент 2 (Браузер / PWA)"] <--> |WebSockets (JSON)| Gateway
-    Client1 <===> |WebRTC P2P / SFU RTP| Client2
+    Client1["Клиент 1 (Браузер / PWA)"] <-->|WebSockets / JSON| Gateway["SquadWave Server (Node.js)"]
+    Client2["Клиент 2 (Браузер / PWA)"] <-->|WebSockets / JSON| Gateway
+    Client1 <-->|WebRTC P2P / SFU RTP| Client2
 
-    Gateway <---> |Встроенный драйвер| DB[("SQLite Database\n(squadwave.db)")]
-    Gateway <---> Coturn["Coturn STUN/TURN\n(Обход Symmetric NAT)"]
+    Gateway <-->|Встроенный драйвер| DB[("SQLite Database")]
+    Gateway <--> Coturn["Coturn STUN / TURN"]
 ```
 
 ---
