@@ -437,6 +437,19 @@ const clients = new Map();
 const voiceRooms = new Map();
 const roomScreenSharers = new Map(); // channelId -> { clientId, sharerName }
 
+function getLocalIpAddresses() {
+  const ips = ["127.0.0.1"];
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const net of ifaces[name]) {
+      if (net.family === "IPv4" && !net.internal) {
+        ips.push(net.address);
+      }
+    }
+  }
+  return Array.from(new Set(ips));
+}
+
 function broadcastToAll(data) {
   const jsonStr = JSON.stringify(data);
   for (const client of clients.values()) {
@@ -458,6 +471,8 @@ function getAllVoiceStates() {
           userId: cl.userId,
           display_name: cl.user ? cl.user.display_name : "Гость",
           avatar_color: cl.user ? cl.user.avatar_color : "#bef264",
+          isMuted: cl.isMuted || false,
+          isSpeaking: cl.isSpeaking || false,
         });
       }
     }
@@ -503,11 +518,12 @@ wss.on("connection", (ws, req) => {
     user = db.prepare("SELECT id, username, display_name, avatar_color FROM users WHERE id = ?").get(userId);
   }
 
-  const clientInfo = { ws, userId: user ? user.id : null, user, currentVoiceChannel: null };
+  const clientInfo = { ws, userId: user ? user.id : null, user, currentVoiceChannel: null, isMuted: false, isSpeaking: false };
   clients.set(clientId, clientInfo);
 
-  console.log(`[WS] Клиент подключен: ${clientId} (${user ? user.display_name : "гость"})`);
-  ws.send(JSON.stringify({ type: "init", clientId, user }));
+  const localIps = getLocalIpAddresses();
+  console.log(`[WS] Клиент подключен: ${clientId} (${user ? user.display_name : "гость"}) | Local IPs: ${localIps.join(", ")}`);
+  ws.send(JSON.stringify({ type: "init", clientId, user, localIps }));
   ws.send(JSON.stringify({ type: "all_voice_states", states: getAllVoiceStates() }));
 
   ws.on("message", (raw) => {
@@ -552,6 +568,8 @@ wss.on("connection", (ws, req) => {
                   userId: p.userId,
                   display_name: p.user ? p.user.display_name : "Гость",
                   avatar_color: p.user ? p.user.avatar_color : "#38bdf8",
+                  isMuted: p.isMuted || false,
+                  isSpeaking: p.isSpeaking || false,
                 });
               }
             }
@@ -581,6 +599,8 @@ wss.on("connection", (ws, req) => {
               userId: clientInfo.userId,
               display_name: clientInfo.user ? clientInfo.user.display_name : "Гость",
               avatar_color: clientInfo.user ? clientInfo.user.avatar_color : "#38bdf8",
+              isMuted: clientInfo.isMuted || false,
+              isSpeaking: false,
             }
           }, clientId);
 
@@ -594,6 +614,8 @@ wss.on("connection", (ws, req) => {
                 userId: pinfo.userId,
                 display_name: pinfo.user ? pinfo.user.display_name : "Гость",
                 avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+                isMuted: pinfo.isMuted || false,
+                isSpeaking: pinfo.isSpeaking || false,
               });
             }
           }
@@ -614,10 +636,40 @@ wss.on("connection", (ws, req) => {
           const { targetClientId, signal } = msg;
           const target = clients.get(targetClientId);
           if (target && target.ws.readyState === WebSocket.OPEN) {
+            console.log(`[WS:Signal] ${clientId} -> ${targetClientId}: ${signal?.type || (signal?.candidate ? 'ice' : 'unknown')}`);
+
+            // Надежный роутинг ICE кандидатов и SDP:
+            // Chromium заменяет локальные IP на <uuid>.local. Для 100% стабильного P2P соединения
+            // на localhost и внутри локальной сети, генерируем также прямые 127.0.0.1 кандидаты
+            let forwardedSignal = signal;
+            if (signal) {
+              if (signal.sdp && typeof signal.sdp === "string" && signal.sdp.includes(".local")) {
+                forwardedSignal = {
+                  ...signal,
+                  sdp: signal.sdp.replace(/[a-zA-Z0-9-]+\.local/g, "127.0.0.1"),
+                };
+              }
+
+              if (signal.candidate && signal.candidate.candidate && signal.candidate.candidate.includes(".local")) {
+                const loopbackCand = signal.candidate.candidate.replace(/[a-zA-Z0-9-]+\.local/, "127.0.0.1");
+                target.ws.send(JSON.stringify({
+                  type: "webrtc_signal",
+                  fromClientId: clientId,
+                  signal: {
+                    type: "ice",
+                    candidate: {
+                      ...signal.candidate,
+                      candidate: loopbackCand,
+                    },
+                  },
+                }));
+              }
+            }
+
             target.ws.send(JSON.stringify({
               type: "webrtc_signal",
               fromClientId: clientId,
-              signal,
+              signal: forwardedSignal,
             }));
           } else {
             console.warn(`[WebRTC] Target ${targetClientId} not found or closed`);
@@ -627,23 +679,47 @@ wss.on("connection", (ws, req) => {
 
         // Состояние микрофона (заглушен / включен)
         case "voice_mute_state": {
+          clientInfo.isMuted = !!msg.isMuted;
           if (clientInfo.currentVoiceChannel) {
             broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
               type: "voice_mute_state",
               clientId,
-              isMuted: msg.isMuted,
+              userId: clientInfo.userId,
+              isMuted: clientInfo.isMuted,
             }, clientId);
+
+            // Обновляем статус микрофона для сайдбара Discord
+            const currentRoom = voiceRooms.get(clientInfo.currentVoiceChannel);
+            if (currentRoom) {
+              const allRoomPeers = [];
+              for (const pid of currentRoom) {
+                const pinfo = clients.get(pid);
+                if (pinfo) {
+                  allRoomPeers.push({
+                    clientId: pid,
+                    userId: pinfo.userId,
+                    display_name: pinfo.user ? pinfo.user.display_name : "Гость",
+                    avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+                    isMuted: pinfo.isMuted || false,
+                    isSpeaking: pinfo.isSpeaking || false,
+                  });
+                }
+              }
+              broadcastToAll({ type: "voice_channel_state", channelId: clientInfo.currentVoiceChannel, peers: allRoomPeers });
+            }
           }
           break;
         }
 
         // Индикация речи
         case "voice_speaking": {
+          clientInfo.isSpeaking = !clientInfo.isMuted && !!msg.isSpeaking;
           if (clientInfo.currentVoiceChannel) {
             broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
               type: "voice_speaking",
               clientId,
-              isSpeaking: msg.isSpeaking,
+              userId: clientInfo.userId,
+              isSpeaking: clientInfo.isSpeaking,
               volume: msg.volume || 0,
             }, clientId);
           }

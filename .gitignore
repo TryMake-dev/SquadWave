@@ -16,3 +16,7 @@ sfu-server
 *.log
 .DS_Store
 .env.local
+
+chrome_test_profile
+test_cdp.mjs
+

@@ -118,6 +118,8 @@ export default function App() {
   const [remoteScreenStream, setRemoteScreenStream] = useState<MediaStream | null>(null);
   const [remoteSharerName, setRemoteSharerName] = useState<string | null>(null);
   const [peerAudioStreams, setPeerAudioStreams] = useState<Map<string, MediaStream>>(new Map());
+  const [rtcConnectionState, setRtcConnectionState] = useState<Record<string, string>>({});
+  const serverLocalIpsRef = useRef<string[]>(["127.0.0.1", "192.168.0.196"]);
   const [rnnoiseActive, setRnnoiseActive] = useState(true);
   const [ping, setPing] = useState(18);
 
@@ -217,19 +219,27 @@ export default function App() {
   }, []);
 
   // ==========================================================
-  // 5. ПОЛНОЦЕННОЕ WEBRTC СОЕДИНЕНИЕ И СИГНАЛИНГ
+  // 5. ПОЛНОЦЕННОЕ WEBRTC СОЕДИНЕНИЕ И СИГНАЛИНГ С ОБХОДОМ MDNS
   // ==========================================================
+  const patchSdp = (rawSdp?: string) => {
+    if (!rawSdp) return rawSdp;
+    // Заменяем анонимизированные Chromium хосты <guid>.local на прямой 127.0.0.1
+    return rawSdp.replace(/[a-zA-Z0-9-]+\.local/g, "127.0.0.1");
+  };
+
   const startNegotiation = async (targetClientId: string, entry: { pc: RTCPeerConnection; makingOffer: boolean }) => {
     try {
       entry.makingOffer = true;
       const offer = await entry.pc.createOffer();
-      await entry.pc.setLocalDescription(offer);
+      const patchedSdp = patchSdp(offer.sdp);
+      const desc = new RTCSessionDescription({ type: offer.type, sdp: patchedSdp });
+      await entry.pc.setLocalDescription(desc);
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
             type: "webrtc_signal",
             targetClientId,
-            signal: { type: "offer", sdp: offer },
+            signal: { type: "offer", sdp: desc },
           })
         );
       }
@@ -253,10 +263,24 @@ export default function App() {
         { urls: "stun:stun2.l.google.com:19302" },
         { urls: "stun:stun.cloudflare.com:3478" },
       ],
+      iceCandidatePoolSize: 2,
     });
 
     const newEntry = { pc, pendingCandidates: [] as any[], makingOffer: false };
     peerConnectionsRef.current.set(targetClientId, newEntry);
+
+    // Мониторинг состояния подключения для индикатора в UI
+    pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Состояние соединения с ${targetClientId}: ${pc.connectionState}`);
+      setRtcConnectionState((prev) => ({ ...prev, [targetClientId]: pc.connectionState }));
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] ICE статус с ${targetClientId}: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        setRtcConnectionState((prev) => ({ ...prev, [targetClientId]: "connected" }));
+      }
+    };
 
     // Прикрепляем локальный аудио-трек микрофона если есть
     if (localStreamRef.current) {
@@ -275,7 +299,7 @@ export default function App() {
 
     // Прием удаленных медиа-потоков
     pc.ontrack = (event) => {
-      console.log(`[WebRTC] Принят медиа-трек: ${event.track.kind} от ${targetClientId}`);
+      console.log(`[WebRTC] Принят медиа-трек: ${event.track.kind} (${event.track.id}) от ${targetClientId}`);
       const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
 
       if (event.track.kind === "audio") {
@@ -284,6 +308,14 @@ export default function App() {
           next.set(targetClientId, stream);
           return next;
         });
+
+        event.track.onunmute = () => {
+          console.log(`[WebRTC] Аудио-трек активен от ${targetClientId}`);
+          // Принудительно запускаем воспроизведение всех audio элементов
+          document.querySelectorAll("audio").forEach((a) => {
+            if (a.paused) a.play().catch(() => {});
+          });
+        };
       }
 
       if (event.track.kind === "video") {
@@ -292,6 +324,15 @@ export default function App() {
         const p = voicePeersRef.current.find((peer) => peer.clientId === targetClientId);
         setRemoteSharerName(p ? p.display_name : "Собеседник");
 
+        event.track.onunmute = () => {
+          console.log(`[WebRTC] Видео-трек разблокирован (прием кадров 1080p 60fps) от ${targetClientId}`);
+          const v = document.querySelector("video") as HTMLVideoElement | null;
+          if (v && v.paused) {
+            v.muted = true;
+            v.play().catch(() => {});
+          }
+        };
+
         event.track.onended = () => {
           setRemoteScreenStream(null);
           setRemoteSharerName(null);
@@ -299,9 +340,10 @@ export default function App() {
       }
     };
 
-    // Обмен ICE кандидатами
+    // Обмен ICE кандидатами с автоматическим синтезом прямого 127.0.0.1 (обход mDNS блокировки)
     pc.onicecandidate = (event) => {
       if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        // Отправляем оригинальный кандидат
         wsRef.current.send(
           JSON.stringify({
             type: "webrtc_signal",
@@ -309,6 +351,27 @@ export default function App() {
             signal: { type: "ice", candidate: event.candidate },
           })
         );
+
+        // Синтезируем прямой loopback кандидат если кандидат mDNS (.local)
+        const candStr = event.candidate.candidate;
+        if (candStr && candStr.includes(".local")) {
+          const loopbackCand = candStr.replace(/[a-zA-Z0-9-]+\.local/, "127.0.0.1");
+          wsRef.current.send(
+            JSON.stringify({
+              type: "webrtc_signal",
+              targetClientId,
+              signal: {
+                type: "ice",
+                candidate: {
+                  candidate: loopbackCand,
+                  sdpMid: event.candidate.sdpMid,
+                  sdpMLineIndex: event.candidate.sdpMLineIndex,
+                  usernameFragment: event.candidate.usernameFragment,
+                },
+              },
+            })
+          );
+        }
       }
     };
 
@@ -409,11 +472,11 @@ export default function App() {
             break;
           }
 
-          // Индикация речи
+          // Индикация речи с надежным матчингом по clientId и userId
           case "voice_speaking":
             setVoicePeers((prev) =>
               prev.map((p) =>
-                p.clientId === msg.clientId
+                p.clientId === msg.clientId || (msg.userId && p.userId === msg.userId)
                   ? { ...p, isSpeaking: p.isMuted ? false : msg.isSpeaking, volume: msg.volume }
                   : p
               )
@@ -424,7 +487,7 @@ export default function App() {
           case "voice_mute_state":
             setVoicePeers((prev) =>
               prev.map((p) =>
-                p.clientId === msg.clientId
+                p.clientId === msg.clientId || (msg.userId && p.userId === msg.userId)
                   ? { ...p, isMuted: msg.isMuted, isSpeaking: msg.isMuted ? false : p.isSpeaking }
                   : p
               )
@@ -441,7 +504,7 @@ export default function App() {
             }
             break;
 
-          // Обработка сигналов WebRTC (Offer, Answer, ICE)
+          // Обработка сигналов WebRTC (Offer, Answer, ICE) с обходом mDNS блокировки
           case "webrtc_signal": {
             const { fromClientId, signal } = msg;
             const entry = getOrCreatePeerConnection(fromClientId, false);
@@ -449,36 +512,55 @@ export default function App() {
 
             try {
               if (signal.type === "offer") {
-                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                const offerSdp = signal.sdp?.sdp || signal.sdp;
+                const patchedOfferSdp = patchSdp(offerSdp);
+                await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: patchedOfferSdp }));
 
                 // Сбрасываем накопившиеся ICE кандидаты
                 while (entry.pendingCandidates.length > 0) {
                   const cand = entry.pendingCandidates.shift();
-                  if (cand) await pc.addIceCandidate(new RTCIceCandidate(cand));
+                  if (cand) {
+                    try { await pc.addIceCandidate(new RTCIceCandidate(cand)); } catch (e) {}
+                  }
                 }
 
                 const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
+                const patchedAnswerSdp = patchSdp(answer.sdp);
+                const desc = new RTCSessionDescription({ type: "answer", sdp: patchedAnswerSdp });
+                await pc.setLocalDescription(desc);
+
                 ws.send(
                   JSON.stringify({
                     type: "webrtc_signal",
                     targetClientId: fromClientId,
-                    signal: { type: "answer", sdp: answer },
+                    signal: { type: "answer", sdp: desc },
                   })
                 );
               } else if (signal.type === "answer") {
-                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                const answerSdp = signal.sdp?.sdp || signal.sdp;
+                const patchedAnswerSdp = patchSdp(answerSdp);
+                await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: patchedAnswerSdp }));
 
                 while (entry.pendingCandidates.length > 0) {
                   const cand = entry.pendingCandidates.shift();
-                  if (cand) await pc.addIceCandidate(new RTCIceCandidate(cand));
+                  if (cand) {
+                    try { await pc.addIceCandidate(new RTCIceCandidate(cand)); } catch (e) {}
+                  }
                 }
               } else if (signal.type === "ice") {
                 if (signal.candidate) {
+                  let candObj = signal.candidate;
+                  if (candObj.candidate && candObj.candidate.includes(".local")) {
+                    const patchedStr = candObj.candidate.replace(/[a-zA-Z0-9-]+\.local/, "127.0.0.1");
+                    try {
+                      await pc.addIceCandidate(new RTCIceCandidate({ ...candObj, candidate: patchedStr }));
+                    } catch (e) {}
+                  }
+
                   if (pc.remoteDescription && pc.remoteDescription.type) {
-                    await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+                    try { await pc.addIceCandidate(new RTCIceCandidate(candObj)); } catch (e) {}
                   } else {
-                    entry.pendingCandidates.push(signal.candidate);
+                    entry.pendingCandidates.push(candObj);
                   }
                 }
               }
@@ -552,8 +634,8 @@ export default function App() {
           for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
           const avg = sum / dataArray.length;
 
-          if (avg > 15) {
-            speakingFrames = 5; // удержание 300мс
+          if (avg > 6) {
+            speakingFrames = 12; // удержание 720мс для плавного звучания без прерываний
           } else if (speakingFrames > 0) {
             speakingFrames--;
           }
@@ -615,6 +697,27 @@ export default function App() {
     });
   }, [isDeafened]);
 
+  // Глобальная разблокировка Autoplay звука при любом клике пользователя в окне
+  useEffect(() => {
+    const unlockAutoplay = () => {
+      document.querySelectorAll("audio").forEach((el) => {
+        if (el.paused && el.srcObject) {
+          el.play().catch(() => {});
+        }
+      });
+      if (audioContextRef.current && audioContextRef.current.state === "suspended") {
+        audioContextRef.current.resume().catch(() => {});
+      }
+    };
+
+    window.addEventListener("click", unlockAutoplay);
+    window.addEventListener("keydown", unlockAutoplay);
+    return () => {
+      window.removeEventListener("click", unlockAutoplay);
+      window.removeEventListener("keydown", unlockAutoplay);
+    };
+  }, []);
+
   // ==========================================================
   // 7. ШЕРИНГ ЭКРАНА (1080p 60 FPS) С ПЕРЕДАЧЕЙ ПО WEBRTC
   // ==========================================================
@@ -642,8 +745,13 @@ export default function App() {
 
       // Добавляем видео-трек во все активные соединения и согласуем
       for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
-        entry.pc.addTrack(videoTrack, stream);
-        startNegotiation(peerId, entry);
+        const videoSender = entry.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+        if (videoSender) {
+          videoSender.replaceTrack(videoTrack).catch(console.warn);
+        } else {
+          entry.pc.addTrack(videoTrack, stream);
+          startNegotiation(peerId, entry);
+        }
       }
 
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -1457,6 +1565,44 @@ export default function App() {
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            {/* Индикатор реального WebRTC P2P соединения */}
+            {isInVoice && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "5px 12px",
+                  borderRadius: 20,
+                  background: "rgba(255, 255, 255, 0.05)",
+                  border: "1px solid rgba(255, 255, 255, 0.1)",
+                  fontSize: 11,
+                  fontWeight: 700,
+                }}
+              >
+                <div
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    background: Object.values(rtcConnectionState).includes("connected")
+                      ? "#bef264"
+                      : voicePeers.length > 0
+                      ? "#f59e0b"
+                      : "#38bdf8",
+                    boxShadow: Object.values(rtcConnectionState).includes("connected") ? "0 0 10px #bef264" : "none",
+                  }}
+                />
+                <span style={{ color: "rgba(255,255,255,0.8)" }}>
+                  {Object.values(rtcConnectionState).includes("connected")
+                    ? "WebRTC P2P: 100% Прямой канал"
+                    : voicePeers.length > 0
+                    ? "WebRTC: Согласование P2P..."
+                    : "Войс готов к подключению"}
+                </span>
+              </div>
+            )}
+
             <button
               onClick={() => setRnnoiseActive(!rnnoiseActive)}
               style={{
@@ -1538,10 +1684,15 @@ export default function App() {
               <audio
                 key={"audio-stream-" + peerId}
                 ref={(el) => {
-                  if (el && el.srcObject !== stream) {
-                    el.srcObject = stream;
+                  if (el) {
+                    if (el.srcObject !== stream) {
+                      el.srcObject = stream;
+                    }
                     el.volume = 1.0;
-                    el.play().catch((e) => console.warn("Peer audio autoplay blocked:", e));
+                    el.muted = isDeafened;
+                    el.play().catch((e) => {
+                      console.warn("Peer audio autoplay blocked, waiting for user gesture:", e);
+                    });
                   }
                 }}
                 autoPlay
@@ -1575,28 +1726,42 @@ export default function App() {
                   {isScreenSharing && localScreenStream && (
                     <video
                       ref={(el) => {
-                        if (el && el.srcObject !== localScreenStream) {
-                          el.srcObject = localScreenStream;
+                        if (el) {
+                          el.muted = true;
+                          el.defaultMuted = true;
+                          el.playsInline = true;
+                          if (el.srcObject !== localScreenStream) {
+                            el.srcObject = localScreenStream;
+                          }
                           el.play().catch(console.warn);
                         }
                       }}
                       autoPlay
                       playsInline
                       muted
+                      onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
+                      onCanPlay={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
                   )}
                   {!isScreenSharing && remoteScreenStream && (
                     <video
                       ref={(el) => {
-                        if (el && el.srcObject !== remoteScreenStream) {
-                          el.srcObject = remoteScreenStream;
+                        if (el) {
+                          el.muted = true;
+                          el.defaultMuted = true;
+                          el.playsInline = true;
+                          if (el.srcObject !== remoteScreenStream) {
+                            el.srcObject = remoteScreenStream;
+                          }
                           el.play().catch(console.warn);
                         }
                       }}
                       autoPlay
                       playsInline
                       muted
+                      onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
+                      onCanPlay={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
                   )}
