@@ -381,9 +381,9 @@ export default function App() {
     // Прием удаленных медиа-потоков
     pc.ontrack = (event) => {
       console.log(`[WebRTC] Принят медиа-трек: ${event.track.kind} (${event.track.id}) от ${targetClientId}`);
-      const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
 
       if (event.track.kind === "audio") {
+        const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
         setPeerAudioStreams((prev) => {
           const next = new Map(prev);
           next.set(targetClientId, stream);
@@ -392,7 +392,6 @@ export default function App() {
 
         event.track.onunmute = () => {
           console.log(`[WebRTC] Аудио-трек активен от ${targetClientId}`);
-          // Принудительно запускаем воспроизведение всех audio элементов
           document.querySelectorAll("audio").forEach((a) => {
             if (a.paused) a.play().catch(() => {});
           });
@@ -401,14 +400,19 @@ export default function App() {
 
       if (event.track.kind === "video") {
         console.log(`[WebRTC] Принят стрим экрана от ${targetClientId}`);
+        const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
         setPeerScreenStreams((prev) => new Map(prev).set(targetClientId, stream));
         setActiveScreenSharers((prev) => new Set(prev).add(targetClientId));
 
         event.track.onunmute = () => {
           console.log(`[WebRTC] Видео-трек разблокирован (прием кадров 1080p 60fps) от ${targetClientId}`);
           const v = document.getElementById(`video-stream-${targetClientId}`) as HTMLVideoElement | null;
-          if (v && v.paused) {
+          if (v) {
             v.muted = true;
+            v.defaultMuted = true;
+            if (v.srcObject !== stream) {
+              v.srcObject = stream;
+            }
             v.play().catch(() => {});
           }
         };
@@ -696,14 +700,27 @@ export default function App() {
             break;
           }
 
-          // Обработка сигналов WebRTC (Offer, Answer, ICE)
+          // Обработка сигналов WebRTC (Offer, Answer, ICE) с Perfect Negotiation (защита от коллизий и черных экранов)
           case "webrtc_signal": {
             const { fromClientId, signal } = msg;
             const entry = getOrCreatePeerConnection(fromClientId, false);
             const pc = entry.pc;
+            const isPolite = (myClientIdRef.current || "") > fromClientId;
 
             try {
               if (signal.type === "offer") {
+                const offerCollision = entry.makingOffer || pc.signalingState !== "stable";
+                if (offerCollision) {
+                  if (!isPolite) {
+                    console.log(`[WebRTC] Glare collision: impolite peer ignoring offer from ${fromClientId}`);
+                    return;
+                  }
+                  console.log(`[WebRTC] Glare collision: polite peer rolling back for ${fromClientId}`);
+                  try {
+                    await pc.setLocalDescription({ type: "rollback" });
+                  } catch (e) {}
+                }
+
                 const offerDesc = signal.sdp?.sdp ? new RTCSessionDescription(signal.sdp) : new RTCSessionDescription({ type: "offer", sdp: signal.sdp });
                 await pc.setRemoteDescription(offerDesc);
 
@@ -852,9 +869,9 @@ export default function App() {
             neuralProcessorRef.current.process(
               inData,
               outData,
-              isMutedRef.current || isDeafenedRef.current,
+              isMutedRef.current,
               (isSpeaking, volume) => {
-                const effectiveSpeaking = (isMutedRef.current || isDeafenedRef.current) ? false : isSpeaking;
+                const effectiveSpeaking = isMutedRef.current ? false : isSpeaking;
                 setIsSelfSpeaking(effectiveSpeaking);
                 setMicTestVolume(effectiveSpeaking ? volume : 0);
                 if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -873,7 +890,7 @@ export default function App() {
           }
 
           // Гарантированная доставка звука через WebSocket Gateway при блокировках UDP/VPN
-          if (!isMutedRef.current && !isDeafenedRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          if (!isMutedRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             let sumSq = 0;
             for (let i = 0; i < outData.length; i++) sumSq += outData[i] * outData[i];
             const rms = Math.sqrt(sumSq / outData.length);
@@ -971,13 +988,6 @@ export default function App() {
       }
     });
 
-    if (nextDeafened) {
-      setIsSelfSpeaking(false);
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "voice_speaking", isSpeaking: false, volume: 0 }));
-      }
-    }
-
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "voice_deafen_state", isDeafened: nextDeafened }));
     }
@@ -1055,46 +1065,42 @@ export default function App() {
         if (videoSender) {
           videoSender.replaceTrack(videoTrack).catch(console.warn);
         } else {
-          const sender = entry.pc.addTrack(videoTrack, stream);
           try {
-            const params = sender.getParameters();
-            if (!params.encodings || params.encodings.length === 0) {
-              params.encodings = [{}];
-            }
-            params.encodings[0].maxBitrate = 8_000_000;
-            params.encodings[0].maxFramerate = 60;
-            params.encodings[0].priority = "high";
-            params.encodings[0].networkPriority = "high";
-            sender.setParameters(params).catch(() => {});
-          } catch (e) {}
-          startNegotiation(peerId, entry);
+            const sender = entry.pc.addTrack(videoTrack, stream);
+            try {
+              const params = sender.getParameters();
+              if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 8_000_000;
+              params.encodings[0].maxFramerate = 60;
+              params.encodings[0].priority = "high";
+              params.encodings[0].networkPriority = "high";
+              sender.setParameters(params).catch(() => {});
+            } catch (e) {}
+          } catch (e) {
+            console.warn("addTrack error:", e);
+          }
         }
+        startNegotiation(peerId, entry);
       }
 
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: "screen_share_status", isSharing: true }));
       }
 
-      // Гарантированная передача кадров экрана через Canvas WebSocket
+      // Гарантированная передача кадров экрана через offscreen video и canvas
       const captureVideo = document.createElement("video");
-      captureVideo.srcObject = stream;
       captureVideo.muted = true;
+      captureVideo.defaultMuted = true;
       captureVideo.playsInline = true;
-      captureVideo.autoplay = true;
-      captureVideo.style.position = "fixed";
-      captureVideo.style.top = "-9999px";
-      captureVideo.style.left = "-9999px";
-      captureVideo.style.width = "10px";
-      captureVideo.style.height = "10px";
-      captureVideo.style.opacity = "0";
-      captureVideo.style.pointerEvents = "none";
+      captureVideo.srcObject = stream;
+      captureVideo.style.cssText = "position:fixed;top:0;left:0;width:320px;height:180px;opacity:0.01;pointer-events:none;z-index:-999;";
       document.body.appendChild(captureVideo);
       captureVideoRef.current = captureVideo;
       captureVideo.play().catch(() => {});
 
       const captureCanvas = document.createElement("canvas");
-      captureCanvas.width = 1920;
-      captureCanvas.height = 1080;
+      captureCanvas.width = 960;
+      captureCanvas.height = 540;
       const ctx2d = captureCanvas.getContext("2d");
 
       if (screenCaptureIntervalRef.current) clearInterval(screenCaptureIntervalRef.current);
@@ -1103,17 +1109,19 @@ export default function App() {
           if (screenCaptureIntervalRef.current) clearInterval(screenCaptureIntervalRef.current);
           return;
         }
-        if (ctx2d && captureVideo.readyState >= 2) {
-          ctx2d.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
-          const frameData = captureCanvas.toDataURL("image/jpeg", 0.85);
-          wsRef.current.send(
-            JSON.stringify({
-              type: "screen_frame",
-              frame: frameData,
-            })
-          );
+        if (ctx2d && captureVideo && captureVideo.readyState >= 2 && captureVideo.videoWidth > 0) {
+          try {
+            ctx2d.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+            const frameData = captureCanvas.toDataURL("image/jpeg", 0.65);
+            wsRef.current.send(
+              JSON.stringify({
+                type: "screen_frame",
+                frame: frameData,
+              })
+            );
+          } catch (err) {}
         }
-      }, 66);
+      }, 100);
 
       videoTrack.onended = () => {
         stopScreenShare();
@@ -1780,7 +1788,7 @@ export default function App() {
                             const isMe = p.clientId === "self" || (currentUser && p.userId === currentUser.id);
                             const peerMuted = isMe ? isMuted : !!p.isMuted;
                             const peerDeafened = isMe ? isDeafened : !!p.isDeafened;
-                            const peerSpeaking = isMe ? isSelfSpeaking : (p.isSpeaking && !peerMuted && !peerDeafened);
+                            const peerSpeaking = isMe ? isSelfSpeaking : (p.isSpeaking && !peerMuted);
                             return (
                               <div
                                 key={p.clientId + p.userId}
@@ -2118,13 +2126,16 @@ export default function App() {
             ))}
 
             {/* Список участников голосовой комнаты и их стримы экрана */}
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-start", width: "100%" }}>
               {/* Локальный пользователь (Вы) */}
               <div
                 style={{
                   display: "flex",
                   alignItems: "stretch",
+                  flexWrap: "wrap",
                   gap: 12,
+                  width: isScreenSharing ? "100%" : "auto",
+                  maxWidth: "100%",
                   background: isScreenSharing ? "rgba(190, 242, 100, 0.04)" : "transparent",
                   padding: isScreenSharing ? "8px 12px" : "0",
                   borderRadius: 16,
@@ -2140,14 +2151,14 @@ export default function App() {
                     padding: 16,
                     borderRadius: 14,
                     background: "rgba(255, 255, 255, 0.03)",
-                    border: isDeafened
-                      ? "1px solid rgba(239, 68, 68, 0.45)"
-                      : isMuted
+                    border: isMuted
                       ? "1px solid rgba(255, 255, 255, 0.08)"
                       : isSelfSpeaking
                       ? "2px solid #bef264"
+                      : isDeafened
+                      ? "1px solid rgba(239, 68, 68, 0.45)"
                       : "1px solid rgba(190, 242, 100, 0.4)",
-                    boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
+                    boxShadow: !isMuted && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
                     display: "flex",
                     flexDirection: "column",
                     alignItems: "center",
@@ -2171,8 +2182,8 @@ export default function App() {
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        border: !isMuted && !isDeafened && isSelfSpeaking ? "2px solid #bef264" : "none",
-                        boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 20px #bef264" : "none",
+                        border: !isMuted && isSelfSpeaking ? "2px solid #bef264" : "none",
+                        boxShadow: !isMuted && isSelfSpeaking ? "0 0 20px #bef264" : "none",
                       }}
                     >
                       {currentUser.display_name[0].toUpperCase()}
@@ -2203,25 +2214,25 @@ export default function App() {
                   <div
                     style={{
                       fontSize: 11,
-                      fontWeight: isDeafened || isMuted ? 600 : 400,
-                      color: isDeafened ? "#ef4444" : isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)",
+                      fontWeight: isMuted ? 600 : isSelfSpeaking ? 700 : isDeafened ? 600 : 400,
+                      color: isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : isDeafened ? "#ef4444" : "rgba(255,255,255,0.5)",
                       display: "flex",
                       alignItems: "center",
                       gap: 4,
                     }}
                   >
-                    {isDeafened ? (
-                      <>
-                        <VolumeX size={12} color="#ef4444" />
-                        <span>Звук выключен</span>
-                      </>
-                    ) : isMuted ? (
+                    {isMuted ? (
                       <>
                         <MicOff size={11} color="#ef4444" />
                         <span>Микрофон выкл</span>
                       </>
                     ) : isSelfSpeaking ? (
                       <span>Говорит</span>
+                    ) : isDeafened ? (
+                      <>
+                        <VolumeX size={12} color="#ef4444" />
+                        <span>Звук выключен</span>
+                      </>
                     ) : (
                       <span>В сети</span>
                     )}
@@ -2239,8 +2250,10 @@ export default function App() {
                   <div
                     id="stream-container-self"
                     style={{
-                      width: "clamp(340px, 42vw, 580px)",
-                      height: 220,
+                      flex: "1 1 360px",
+                      maxWidth: 720,
+                      minWidth: 280,
+                      height: 240,
                       borderRadius: 14,
                       background: "#000000",
                       border: "2px solid #bef264",
@@ -2258,7 +2271,7 @@ export default function App() {
                         display: "flex",
                         justifyContent: "space-between",
                         alignItems: "center",
-                        zIndex: 2,
+                        zIndex: 10,
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -2320,6 +2333,7 @@ export default function App() {
                         alignItems: "center",
                         justifyContent: "center",
                         cursor: "pointer",
+                        overflow: "hidden",
                       }}
                       onDoubleClick={() => toggleFullscreen("stream-container-self")}
                     >
@@ -2349,7 +2363,7 @@ export default function App() {
               {voicePeers.map((peer) => {
                 const isPeerDeafened = !!peer.isDeafened;
                 const isPeerMuted = !!peer.isMuted;
-                const isSpeaking = peer.isSpeaking && !isPeerMuted && !isPeerDeafened;
+                const isSpeaking = peer.isSpeaking && !isPeerMuted;
                 const isPeerStreaming = activeScreenSharers.has(peer.clientId) || !!peer.isSharingScreen;
                 const peerStream = peerScreenStreams.get(peer.clientId);
                 const peerFrame = peerScreenFrames.get(peer.clientId);
@@ -2361,7 +2375,10 @@ export default function App() {
                     style={{
                       display: "flex",
                       alignItems: "stretch",
+                      flexWrap: "wrap",
                       gap: 12,
+                      width: isPeerStreaming ? "100%" : "auto",
+                      maxWidth: "100%",
                       background: isPeerStreaming ? "rgba(56, 189, 248, 0.04)" : "transparent",
                       padding: isPeerStreaming ? "8px 12px" : "0",
                       borderRadius: 16,
@@ -2377,14 +2394,14 @@ export default function App() {
                         padding: 16,
                         borderRadius: 14,
                         background: "rgba(255, 255, 255, 0.03)",
-                        border: isPeerDeafened
-                          ? "1px solid rgba(239, 68, 68, 0.4)"
-                          : isPeerMuted
+                        border: isPeerMuted
                           ? "1px solid rgba(255, 255, 255, 0.08)"
                           : isSpeaking
                           ? `2px solid ${peer.avatar_color}`
+                          : isPeerDeafened
+                          ? "1px solid rgba(239, 68, 68, 0.4)"
                           : "1px solid rgba(255, 255, 255, 0.08)",
-                        boxShadow: isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
+                        boxShadow: !isPeerMuted && isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
                         display: "flex",
                         flexDirection: "column",
                         alignItems: "center",
@@ -2408,8 +2425,8 @@ export default function App() {
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
-                            border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
-                            boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
+                            border: !isPeerMuted && isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
+                            boxShadow: !isPeerMuted && isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
                           }}
                         >
                           {peer.display_name[0].toUpperCase()}
@@ -2440,25 +2457,25 @@ export default function App() {
                       <div
                         style={{
                           fontSize: 11,
-                          fontWeight: isPeerDeafened || isPeerMuted ? 600 : 400,
-                          color: isPeerDeafened ? "#ef4444" : isPeerMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)",
+                          fontWeight: isPeerMuted ? 600 : isSpeaking ? 700 : isPeerDeafened ? 600 : 400,
+                          color: isPeerMuted ? "#ef4444" : isSpeaking ? "#bef264" : isPeerDeafened ? "#ef4444" : "rgba(255,255,255,0.4)",
                           display: "flex",
                           alignItems: "center",
                           gap: 4,
                         }}
                       >
-                        {isPeerDeafened ? (
-                          <>
-                            <VolumeX size={12} color="#ef4444" />
-                            <span>Звук выключен</span>
-                          </>
-                        ) : isPeerMuted ? (
+                        {isPeerMuted ? (
                           <>
                             <MicOff size={11} color="#ef4444" />
                             <span>Микрофон выкл</span>
                           </>
                         ) : isSpeaking ? (
                           <span>Говорит</span>
+                        ) : isPeerDeafened ? (
+                          <>
+                            <VolumeX size={12} color="#ef4444" />
+                            <span>Звук выключен</span>
+                          </>
                         ) : (
                           <span>Слушает</span>
                         )}
@@ -2476,8 +2493,10 @@ export default function App() {
                       <div
                         id={containerId}
                         style={{
-                          width: "clamp(340px, 42vw, 580px)",
-                          height: 220,
+                          flex: "1 1 360px",
+                          maxWidth: 720,
+                          minWidth: 280,
+                          height: 240,
                           borderRadius: 14,
                           background: "#000000",
                           border: "2px solid #38bdf8",
@@ -2495,7 +2514,7 @@ export default function App() {
                             display: "flex",
                             justifyContent: "space-between",
                             alignItems: "center",
-                            zIndex: 2,
+                            zIndex: 10,
                           }}
                         >
                           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -2536,10 +2555,28 @@ export default function App() {
                             justifyContent: "center",
                             cursor: "pointer",
                             position: "relative",
+                            overflow: "hidden",
                           }}
                           onDoubleClick={() => toggleFullscreen(containerId)}
                         >
-                          {peerStream ? (
+                          {/* Слой 1: Живой WebSocket кадр (мгновенный показ без ожидания WebRTC) */}
+                          {peerFrame && (
+                            <img
+                              src={peerFrame}
+                              alt={`Стрим ${peer.display_name}`}
+                              style={{
+                                position: "absolute",
+                                inset: 0,
+                                width: "100%",
+                                height: "100%",
+                                objectFit: "contain",
+                                zIndex: 1,
+                              }}
+                            />
+                          )}
+
+                          {/* Слой 2: Нативный 1080p60 WebRTC PeerStream поверх */}
+                          {peerStream && (
                             <video
                               id={`video-stream-${peer.clientId}`}
                               ref={(el) => {
@@ -2556,16 +2593,25 @@ export default function App() {
                               autoPlay
                               playsInline
                               muted
-                              style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                              onLoadedMetadata={(e) => {
+                                (e.target as HTMLVideoElement).play().catch(() => {});
+                              }}
+                              onCanPlay={(e) => {
+                                (e.target as HTMLVideoElement).play().catch(() => {});
+                              }}
+                              style={{
+                                position: "relative",
+                                zIndex: 2,
+                                width: "100%",
+                                height: "100%",
+                                objectFit: "contain",
+                              }}
                             />
-                          ) : peerFrame ? (
-                            <img
-                              src={peerFrame}
-                              alt={`Стрим ${peer.display_name}`}
-                              style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                            />
-                          ) : (
-                            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                          )}
+
+                          {/* Индикатор подключения если еще не получены ни WebRTC трек, ни кадры */}
+                          {!peerStream && !peerFrame && (
+                            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, display: "flex", alignItems: "center", gap: 6, zIndex: 0 }}>
                               <Monitor size={16} />
                               <span>Подключение к 1080p60 WebRTC потоку...</span>
                             </div>
@@ -2741,7 +2787,10 @@ export default function App() {
                     fontWeight: 700,
                   }}
                 >
-                  🔊 Голосовой
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                    <Volume2 size={15} />
+                    <span>Голосовой</span>
+                  </div>
                 </button>
               </div>
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
@@ -2851,8 +2900,9 @@ export default function App() {
                   Обновить
                 </button>
               </div>
-              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 6 }}>
-                💡 Браузер запрашивает доступ к микрофонам ПК. Вы можете переключать гарнитуры, USB-микрофоны и веб-камеры на лету без перезагрузки.
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 6, display: "flex", alignItems: "center", gap: 5 }}>
+                <HelpCircle size={13} color="#bef264" />
+                <span>Браузер запрашивает доступ к микрофонам ПК. Вы можете переключать гарнитуры, USB-микрофоны и веб-камеры на лету без перезагрузки.</span>
               </div>
             </div>
 
