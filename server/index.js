@@ -473,6 +473,7 @@ function getAllVoiceStates() {
           display_name: cl.user ? cl.user.display_name : "Гость",
           avatar_color: cl.user ? cl.user.avatar_color : "#bef264",
           isMuted: cl.isMuted || false,
+          isDeafened: cl.isDeafened || false,
           isSpeaking: cl.isSpeaking || false,
         });
       }
@@ -519,7 +520,7 @@ wss.on("connection", (ws, req) => {
     user = db.prepare("SELECT id, username, display_name, avatar_color FROM users WHERE id = ?").get(userId);
   }
 
-  const clientInfo = { ws, userId: user ? user.id : null, user, currentVoiceChannel: null, isMuted: false, isSpeaking: false };
+  const clientInfo = { ws, userId: user ? user.id : null, user, currentVoiceChannel: null, isMuted: false, isDeafened: false, isSpeaking: false };
   clients.set(clientId, clientInfo);
 
   const localIps = getLocalIpAddresses();
@@ -570,6 +571,7 @@ wss.on("connection", (ws, req) => {
                   display_name: p.user ? p.user.display_name : "Гость",
                   avatar_color: p.user ? p.user.avatar_color : "#38bdf8",
                   isMuted: p.isMuted || false,
+                  isDeafened: p.isDeafened || false,
                   isSpeaking: p.isSpeaking || false,
                 });
               }
@@ -601,6 +603,7 @@ wss.on("connection", (ws, req) => {
               display_name: clientInfo.user ? clientInfo.user.display_name : "Гость",
               avatar_color: clientInfo.user ? clientInfo.user.avatar_color : "#38bdf8",
               isMuted: clientInfo.isMuted || false,
+              isDeafened: clientInfo.isDeafened || false,
               isSpeaking: false,
             }
           }, clientId);
@@ -616,6 +619,7 @@ wss.on("connection", (ws, req) => {
                 display_name: pinfo.user ? pinfo.user.display_name : "Гость",
                 avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
                 isMuted: pinfo.isMuted || false,
+                isDeafened: pinfo.isDeafened || false,
                 isSpeaking: pinfo.isSpeaking || false,
               });
             }
@@ -702,6 +706,41 @@ wss.on("connection", (ws, req) => {
                     display_name: pinfo.user ? pinfo.user.display_name : "Гость",
                     avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
                     isMuted: pinfo.isMuted || false,
+                    isDeafened: pinfo.isDeafened || false,
+                    isSpeaking: pinfo.isSpeaking || false,
+                  });
+                }
+              }
+              broadcastToAll({ type: "voice_channel_state", channelId: clientInfo.currentVoiceChannel, peers: allRoomPeers });
+            }
+          }
+          break;
+        }
+
+        // Состояние наушников (заглушен звук / включен)
+        case "voice_deafen_state": {
+          clientInfo.isDeafened = !!msg.isDeafened;
+          if (clientInfo.currentVoiceChannel) {
+            broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
+              type: "voice_deafen_state",
+              clientId,
+              userId: clientInfo.userId,
+              isDeafened: clientInfo.isDeafened,
+            }, clientId);
+
+            const currentRoom = voiceRooms.get(clientInfo.currentVoiceChannel);
+            if (currentRoom) {
+              const allRoomPeers = [];
+              for (const pid of currentRoom) {
+                const pinfo = clients.get(pid);
+                if (pinfo) {
+                  allRoomPeers.push({
+                    clientId: pid,
+                    userId: pinfo.userId,
+                    display_name: pinfo.user ? pinfo.user.display_name : "Гость",
+                    avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+                    isMuted: pinfo.isMuted || false,
+                    isDeafened: pinfo.isDeafened || false,
                     isSpeaking: pinfo.isSpeaking || false,
                   });
                 }
@@ -822,6 +861,8 @@ function leaveVoiceRoom(clientId, channelId) {
           userId: pinfo.userId,
           display_name: pinfo.user ? pinfo.user.display_name : "Гость",
           avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+          isMuted: pinfo.isMuted || false,
+          isDeafened: pinfo.isDeafened || false,
         });
       }
     }

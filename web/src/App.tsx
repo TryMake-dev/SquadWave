@@ -72,6 +72,7 @@ interface VoicePeer {
   avatar_color: string;
   isSpeaking?: boolean;
   isMuted?: boolean;
+  isDeafened?: boolean;
   volume?: number;
 }
 
@@ -572,6 +573,17 @@ export default function App() {
             );
             break;
 
+          // Состояние наушников другого пользователя
+          case "voice_deafen_state":
+            setVoicePeers((prev) =>
+              prev.map((p) =>
+                p.clientId === msg.clientId || (msg.userId && p.userId === msg.userId)
+                  ? { ...p, isDeafened: msg.isDeafened }
+                  : p
+              )
+            );
+            break;
+
           // Уведомление о стриме экрана
           case "screen_share_status":
             if (!msg.isSharing) {
@@ -797,16 +809,17 @@ export default function App() {
             neuralProcessorRef.current.process(
               inData,
               outData,
-              isMutedRef.current,
+              isMutedRef.current || isDeafenedRef.current,
               (isSpeaking, volume) => {
-                setIsSelfSpeaking(isSpeaking);
-                setMicTestVolume(volume);
+                const effectiveSpeaking = (isMutedRef.current || isDeafenedRef.current) ? false : isSpeaking;
+                setIsSelfSpeaking(effectiveSpeaking);
+                setMicTestVolume(effectiveSpeaking ? volume : 0);
                 if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                   wsRef.current.send(
                     JSON.stringify({
                       type: "voice_speaking",
-                      isSpeaking,
-                      volume,
+                      isSpeaking: effectiveSpeaking,
+                      volume: effectiveSpeaking ? volume : 0,
                     })
                   );
                 }
@@ -817,7 +830,7 @@ export default function App() {
           }
 
           // Гарантированная доставка звука через WebSocket Gateway при блокировках UDP/VPN
-          if (!isMutedRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          if (!isMutedRef.current && !isDeafenedRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             let sumSq = 0;
             for (let i = 0; i < outData.length; i++) sumSq += outData[i] * outData[i];
             const rms = Math.sqrt(sumSq / outData.length);
@@ -914,6 +927,17 @@ export default function App() {
         el.play().catch(() => {});
       }
     });
+
+    if (nextDeafened) {
+      setIsSelfSpeaking(false);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "voice_speaking", isSpeaking: false, volume: 0 }));
+      }
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "voice_deafen_state", isDeafened: nextDeafened }));
+    }
   };
 
   useEffect(() => {
@@ -1097,6 +1121,12 @@ export default function App() {
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "voice_join", channelId: channel.id }));
+      if (isMutedRef.current) {
+        wsRef.current.send(JSON.stringify({ type: "voice_mute_state", isMuted: true }));
+      }
+      if (isDeafenedRef.current) {
+        wsRef.current.send(JSON.stringify({ type: "voice_deafen_state", isDeafened: true }));
+      }
     }
   };
 
@@ -1673,19 +1703,33 @@ export default function App() {
                     {/* Список участников голосовой комнаты (виден ВСЕМ пользователям как в Discord) */}
                     {(() => {
                       const list = isCurrent
-                        ? [{ clientId: "self", userId: currentUser.id, display_name: `${currentUser.display_name} (Вы)`, avatar_color: currentUser.avatar_color, isSpeaking: false }, ...voicePeers]
+                        ? [
+                            {
+                              clientId: "self",
+                              userId: currentUser.id,
+                              display_name: `${currentUser.display_name} (Вы)`,
+                              avatar_color: currentUser.avatar_color,
+                              isSpeaking: isSelfSpeaking,
+                              isMuted,
+                              isDeafened,
+                            },
+                            ...voicePeers,
+                          ]
                         : (voiceRoomStates[ch.id] || []);
                       if (list.length === 0) return null;
                       return (
                         <div style={{ paddingLeft: 26, display: "flex", flexDirection: "column", gap: 5, marginTop: 4, marginBottom: 4 }}>
                           {list.map((p) => {
                             const isMe = p.clientId === "self" || (currentUser && p.userId === currentUser.id);
+                            const peerMuted = isMe ? isMuted : !!p.isMuted;
+                            const peerDeafened = isMe ? isDeafened : !!p.isDeafened;
+                            const peerSpeaking = isMe ? isSelfSpeaking : (p.isSpeaking && !peerMuted && !peerDeafened);
                             return (
                               <div
                                 key={p.clientId + p.userId}
                                 style={{
                                   fontSize: 12,
-                                  color: isMe ? "#bef264" : (p.isSpeaking && !p.isMuted) ? "#bef264" : "rgba(255,255,255,0.7)",
+                                  color: isMe ? "#bef264" : peerSpeaking ? "#bef264" : "rgba(255,255,255,0.7)",
                                   display: "flex",
                                   alignItems: "center",
                                   gap: 6,
@@ -1704,8 +1748,8 @@ export default function App() {
                                     display: "flex",
                                     alignItems: "center",
                                     justifyContent: "center",
-                                    border: (isMe ? isSelfSpeaking : (p.isSpeaking && !p.isMuted)) ? "2px solid #bef264" : "none",
-                                    boxShadow: (isMe ? isSelfSpeaking : (p.isSpeaking && !p.isMuted)) ? "0 0 6px #bef264" : "none",
+                                    border: peerSpeaking ? "2px solid #bef264" : "none",
+                                    boxShadow: peerSpeaking ? "0 0 6px #bef264" : "none",
                                   }}
                                 >
                                   {p.display_name[0].toUpperCase()}
@@ -1713,7 +1757,10 @@ export default function App() {
                                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                                   {p.display_name}
                                 </span>
-                                {(isMe ? isMuted : p.isMuted) && <MicOff size={11} color="#ef4444" />}
+                                <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
+                                  {peerDeafened && <VolumeX size={12} color="#ef4444" title="Звук выключен (наушники)" />}
+                                  {peerMuted && <MicOff size={11} color="#ef4444" title="Микрофон выключен" />}
+                                </div>
                               </div>
                             );
                           })}
@@ -1730,9 +1777,9 @@ export default function App() {
         {isInVoice && (
           <div style={{ padding: "12px 14px", background: "rgba(0, 0, 0, 0.45)", borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#10b981" }}>
-                <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
-                <span>ГОЛОС ПОДКЛЮЧЕН</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: isDeafened ? "#ef4444" : "#10b981" }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: isDeafened ? "#ef4444" : "#10b981", boxShadow: isDeafened ? "0 0 6px #ef4444" : "0 0 6px #10b981" }} />
+                <span>{isDeafened ? "ЗВУК ВЫКЛЮЧЕН" : "ГОЛОС ПОДКЛЮЧЕН"}</span>
               </div>
               <span style={{ fontFamily: "monospace", fontSize: 12, color: ping < 45 ? "#bef264" : ping < 120 ? "#facc15" : "#ef4444", fontWeight: 800 }}>{ping} ms</span>
             </div>
@@ -1762,21 +1809,43 @@ export default function App() {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div
-              style={{
-                width: 34,
-                height: 34,
-                borderRadius: "50%",
-                background: currentUser.avatar_color,
-                color: "#090a0f",
-                fontWeight: 900,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 14,
-              }}
-            >
-              {currentUser.display_name[0].toUpperCase()}
+            <div style={{ position: "relative" }}>
+              <div
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: "50%",
+                  background: currentUser.avatar_color,
+                  color: "#090a0f",
+                  fontWeight: 900,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 14,
+                }}
+              >
+                {currentUser.display_name[0].toUpperCase()}
+              </div>
+              {(isDeafened || isMuted) && (
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: -2,
+                    right: -2,
+                    width: 14,
+                    height: 14,
+                    borderRadius: "50%",
+                    background: "#ef4444",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    border: "2px solid #080a0f",
+                  }}
+                  title={isDeafened ? "Звук выключен" : "Микрофон выключен"}
+                >
+                  {isDeafened ? <VolumeX size={8} color="#fff" /> : <MicOff size={8} color="#fff" />}
+                </div>
+              )}
             </div>
             <div>
               <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name}</div>
@@ -1810,8 +1879,8 @@ export default function App() {
                 width: 30,
                 height: 30,
                 borderRadius: 6,
-                background: isDeafened ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                border: "none",
+                background: isDeafened ? "rgba(239, 68, 68, 0.25)" : "rgba(255, 255, 255, 0.05)",
+                border: isDeafened ? "1px solid rgba(239, 68, 68, 0.4)" : "none",
                 color: isDeafened ? "#ef4444" : "#ffffff",
                 display: "flex",
                 alignItems: "center",
@@ -2075,47 +2144,98 @@ export default function App() {
                   padding: 16,
                   borderRadius: 14,
                   background: "rgba(255, 255, 255, 0.03)",
-                  border: isMuted
+                  border: isDeafened
+                    ? "1px solid rgba(239, 68, 68, 0.45)"
+                    : isMuted
                     ? "1px solid rgba(255, 255, 255, 0.08)"
                     : isSelfSpeaking
                     ? "2px solid #bef264"
                     : "1px solid rgba(190, 242, 100, 0.4)",
-                  boxShadow: !isMuted && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
+                  boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
                   display: "flex",
                   flexDirection: "column",
                   alignItems: "center",
                   justifyContent: "center",
                   gap: 8,
                   transition: "all 0.15s ease",
+                  position: "relative",
                 }}
               >
-                <div
-                  style={{
-                    width: 58,
-                    height: 58,
-                    borderRadius: "50%",
-                    background: currentUser.avatar_color,
-                    color: "#090a0f",
-                    fontWeight: 900,
-                    fontSize: 24,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    border: !isMuted && isSelfSpeaking ? "2px solid #bef264" : "none",
-                    boxShadow: !isMuted && isSelfSpeaking ? "0 0 20px #bef264" : "none",
-                  }}
-                >
-                  {currentUser.display_name[0].toUpperCase()}
+                <div style={{ position: "relative" }}>
+                  <div
+                    style={{
+                      width: 58,
+                      height: 58,
+                      borderRadius: "50%",
+                      background: currentUser.avatar_color,
+                      color: "#090a0f",
+                      fontWeight: 900,
+                      fontSize: 24,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      border: !isMuted && !isDeafened && isSelfSpeaking ? "2px solid #bef264" : "none",
+                      boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 20px #bef264" : "none",
+                    }}
+                  >
+                    {currentUser.display_name[0].toUpperCase()}
+                  </div>
+                  {(isDeafened || isMuted) && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        bottom: -2,
+                        right: -2,
+                        width: 22,
+                        height: 22,
+                        borderRadius: "50%",
+                        background: "#ef4444",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        border: "2px solid #0d0f15",
+                        boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                      }}
+                      title={isDeafened ? "Звук выключен (наушники)" : "Микрофон выключен"}
+                    >
+                      {isDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                    </div>
+                  )}
                 </div>
                 <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
-                <div style={{ fontSize: 11, color: isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)" }}>
-                  {isMuted ? "Микрофон выкл" : isSelfSpeaking ? "Говорит 🔊" : "В сети"}
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: isDeafened || isMuted ? 600 : 400,
+                    color: isDeafened ? "#ef4444" : isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                >
+                  {isDeafened ? (
+                    <>
+                      <VolumeX size={12} color="#ef4444" />
+                      <span>Звук выключен 🔇</span>
+                    </>
+                  ) : isMuted ? (
+                    <>
+                      <MicOff size={11} color="#ef4444" />
+                      <span>Микрофон выкл</span>
+                    </>
+                  ) : isSelfSpeaking ? (
+                    <span>Говорит 🔊</span>
+                  ) : (
+                    <span>В сети</span>
+                  )}
                 </div>
               </div>
 
               {/* Удаленные участники (светятся при речи и воспроизводят звук!) */}
               {voicePeers.map((peer) => {
-                const isSpeaking = peer.isSpeaking && !peer.isMuted;
+                const isPeerDeafened = !!peer.isDeafened;
+                const isPeerMuted = !!peer.isMuted;
+                const isSpeaking = peer.isSpeaking && !isPeerMuted && !isPeerDeafened;
                 return (
                   <div
                     key={peer.clientId}
@@ -2124,7 +2244,9 @@ export default function App() {
                       padding: 16,
                       borderRadius: 14,
                       background: "rgba(255, 255, 255, 0.03)",
-                      border: peer.isMuted
+                      border: isPeerDeafened
+                        ? "1px solid rgba(239, 68, 68, 0.4)"
+                        : isPeerMuted
                         ? "1px solid rgba(255, 255, 255, 0.08)"
                         : isSpeaking
                         ? `2px solid ${peer.avatar_color}`
@@ -2136,29 +2258,76 @@ export default function App() {
                       justifyContent: "center",
                       gap: 8,
                       transition: "all 0.15s ease",
+                      position: "relative",
                     }}
                   >
-                    <div
-                      style={{
-                        width: 58,
-                        height: 58,
-                        borderRadius: "50%",
-                        background: peer.avatar_color,
-                        color: "#090a0f",
-                        fontWeight: 900,
-                        fontSize: 24,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
-                        boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
-                      }}
-                    >
-                      {peer.display_name[0].toUpperCase()}
+                    <div style={{ position: "relative" }}>
+                      <div
+                        style={{
+                          width: 58,
+                          height: 58,
+                          borderRadius: "50%",
+                          background: peer.avatar_color,
+                          color: "#090a0f",
+                          fontWeight: 900,
+                          fontSize: 24,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
+                          boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
+                        }}
+                      >
+                        {peer.display_name[0].toUpperCase()}
+                      </div>
+                      {(isPeerDeafened || isPeerMuted) && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            bottom: -2,
+                            right: -2,
+                            width: 22,
+                            height: 22,
+                            borderRadius: "50%",
+                            background: "#ef4444",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            border: "2px solid #0d0f15",
+                            boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                          }}
+                          title={isPeerDeafened ? "Звук выключен (наушники)" : "Микрофон выключен"}
+                        >
+                          {isPeerDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                        </div>
+                      )}
                     </div>
                     <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
-                    <div style={{ fontSize: 11, color: peer.isMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)" }}>
-                      {peer.isMuted ? "Микрофон выкл" : isSpeaking ? "Говорит 🔊" : "Слушает"}
+                    <div
+                      style={{
+                        fontSize: 11,
+                        fontWeight: isPeerDeafened || isPeerMuted ? 600 : 400,
+                        color: isPeerDeafened ? "#ef4444" : isPeerMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                      }}
+                    >
+                      {isPeerDeafened ? (
+                        <>
+                          <VolumeX size={12} color="#ef4444" />
+                          <span>Звук выключен 🔇</span>
+                        </>
+                      ) : isPeerMuted ? (
+                        <>
+                          <MicOff size={11} color="#ef4444" />
+                          <span>Микрофон выкл</span>
+                        </>
+                      ) : isSpeaking ? (
+                        <span>Говорит 🔊</span>
+                      ) : (
+                        <span>Слушает</span>
+                      )}
                     </div>
                   </div>
                 );
