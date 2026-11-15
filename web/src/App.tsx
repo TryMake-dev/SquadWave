@@ -122,8 +122,13 @@ export default function App() {
   const [rtcConnectionState, setRtcConnectionState] = useState<Record<string, string>>({});
   const serverLocalIpsRef = useRef<string[]>(["127.0.0.1", "192.168.0.196"]);
   const playbackAudioCtxRef = useRef<AudioContext | null>(null);
+  const nextPcmPlayTimeRef = useRef<number>(0);
   const screenCaptureIntervalRef = useRef<any>(null);
   const [rnnoiseActive, setRnnoiseActive] = useState(true);
+  const rnnoiseActiveRef = useRef(true);
+  rnnoiseActiveRef.current = rnnoiseActive;
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>("");
   const [ping, setPing] = useState(18);
 
   // Модальные окна
@@ -147,6 +152,36 @@ export default function App() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Загрузка доступных микрофонов
+  const refreshAudioDevices = async () => {
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((d) => d.kind === "audioinput");
+      setAudioDevices(inputs);
+      if (inputs.length > 0 && !selectedAudioDeviceId) {
+        setSelectedAudioDeviceId(inputs[0].deviceId);
+      }
+    } catch (err) {
+      console.warn("Device enumeration error:", err);
+    }
+  };
+
+  useEffect(() => {
+    refreshAudioDevices();
+    navigator.mediaDevices?.addEventListener?.("devicechange", refreshAudioDevices);
+    return () => {
+      navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
+    };
+  }, []);
+
+  const handleAudioDeviceChange = async (newDeviceId: string) => {
+    setSelectedAudioDeviceId(newDeviceId);
+    if (isInVoice) {
+      await startAudioCapture(newDeviceId);
+    }
+  };
 
   // 1. Проверка сессии
   useEffect(() => {
@@ -514,7 +549,7 @@ export default function App() {
             }
             break;
 
-          // Гарантированный живой звук через Web Audio PCM
+          // Гарантированный живой звук через Web Audio PCM с защитой от треска и наслоения (Jitter Queue)
           case "voice_pcm": {
             if (isDeafened) break;
             try {
@@ -534,10 +569,20 @@ export default function App() {
                 }
                 const audioBuffer = pCtx.createBuffer(1, floatArr.length, 24000);
                 audioBuffer.copyToChannel(floatArr, 0);
+
                 const source = pCtx.createBufferSource();
                 source.buffer = audioBuffer;
                 source.connect(pCtx.destination);
-                source.start();
+
+                // Бесшовное планирование времени воспроизведения без разрывов и наслоений
+                const now = pCtx.currentTime;
+                if (nextPcmPlayTimeRef.current < now) {
+                  // При паузе речи или первом пакете стартуем через 35мс (буфер против джиттера)
+                  nextPcmPlayTimeRef.current = now + 0.035;
+                }
+
+                source.start(nextPcmPlayTimeRef.current);
+                nextPcmPlayTimeRef.current += audioBuffer.duration;
               }
             } catch (err) {
               console.warn("PCM audio playback error:", err);
@@ -617,11 +662,13 @@ export default function App() {
     };
   }, [currentUser?.id, authToken]);
 
-  // Захват чистого микрофона и VAD индикация речи
-  const startAudioCapture = async () => {
+  // Захват микрофона с выбором устройства и профессиональным DSP шумоподавлением
+  const startAudioCapture = async (deviceId?: string) => {
     try {
+      const targetDeviceId = deviceId || selectedAudioDeviceId;
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          deviceId: targetDeviceId ? { exact: targetDeviceId } : undefined,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
@@ -631,9 +678,14 @@ export default function App() {
         video: false,
       });
 
+      refreshAudioDevices();
       localStreamRef.current = stream;
 
-      // Web Audio API анализатор для детекции речи (НЕ блокирует и не портит аудио-поток WebRTC!)
+      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+        audioContextRef.current.close().catch(() => {});
+      }
+
+      // Web Audio API DSP процессинг: обрезка клавиатуры, низкочастотного гула и гейт
       try {
         const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
         audioContextRef.current = ctx;
@@ -641,25 +693,68 @@ export default function App() {
           ctx.resume().catch(() => {});
         }
         const source = ctx.createMediaStreamSource(stream);
+
+        // 1. Highpass: срез саб-басового гула и вибраций стола (< 85 Гц)
+        const highpass = ctx.createBiquadFilter();
+        highpass.type = "highpass";
+        highpass.frequency.value = 85;
+
+        // 2. Notch/Peaking: срез частоты щелчков механической клавиатуры (~3200 Гц)
+        const notch = ctx.createBiquadFilter();
+        notch.type = "peaking";
+        notch.frequency.value = 3200;
+        notch.Q.value = 1.8;
+        notch.gain.value = rnnoiseActiveRef.current ? -14 : 0;
+
+        // 3. Compressor: выравнивание пиков громкости
+        const compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.value = -24;
+        compressor.knee.value = 15;
+        compressor.ratio.value = 5;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.2;
+
+        source.connect(highpass);
+        highpass.connect(notch);
+        notch.connect(compressor);
+
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 64;
-        source.connect(analyser);
+        compressor.connect(analyser);
 
-        // Гарантированная передача голоса (Web Audio PCM) напрямую через шлюз
+        // Изолируем PCM процессор через нулевой Gain (исключает самовозбуждение и эхо в динамики)
         const pcmProcessor = ctx.createScriptProcessor(2048, 1, 1);
-        source.connect(pcmProcessor);
-        pcmProcessor.connect(ctx.destination);
+        compressor.connect(pcmProcessor);
 
+        const dummyGain = ctx.createGain();
+        dummyGain.gain.value = 0;
+        pcmProcessor.connect(dummyGain);
+        dummyGain.connect(ctx.destination);
+
+        let gateHoldFrames = 0;
         pcmProcessor.onaudioprocess = (e) => {
           if (isMutedRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
           const inputData = e.inputBuffer.getChannelData(0);
-          let sumVol = 0;
-          for (let i = 0; i < inputData.length; i++) sumVol += Math.abs(inputData[i]);
-          if (sumVol / inputData.length < 0.003) return; // тишина
 
+          let sumSq = 0;
+          for (let i = 0; i < inputData.length; i++) sumSq += inputData[i] * inputData[i];
+          const rms = Math.sqrt(sumSq / inputData.length);
+
+          // Умный гейт: при включенном RNNoise порог 0.010 (полностью отсекает клавиатуру и фоновый шум)
+          const gateThreshold = rnnoiseActiveRef.current ? 0.010 : 0.003;
+          if (rms > gateThreshold) {
+            gateHoldFrames = 8; // удержание ~340мс
+          } else if (gateHoldFrames > 0) {
+            gateHoldFrames--;
+          }
+
+          if (gateHoldFrames <= 0) return; // Гейт закрыт: тишина, клики клавиатуры не передаются!
+
+          // Сглаженный антиалиасинг даунсемплинг до 24кГц
           const downsampled = new Int16Array(Math.floor(inputData.length / 2));
           for (let i = 0; i < downsampled.length; i++) {
-            const s = Math.max(-1, Math.min(1, inputData[i * 2]));
+            const avgSample = (inputData[i * 2] + inputData[i * 2 + 1]) * 0.5;
+            const s = Math.max(-1, Math.min(1, avgSample));
             downsampled[i] = Math.round(s * 32767);
           }
 
@@ -697,8 +792,9 @@ export default function App() {
           for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
           const avg = sum / dataArray.length;
 
-          if (avg > 6) {
-            speakingFrames = 12; // удержание 720мс для плавного звучания без прерываний
+          const vadThreshold = rnnoiseActiveRef.current ? 9 : 5;
+          if (avg > vadThreshold) {
+            speakingFrames = 10;
           } else if (speakingFrames > 0) {
             speakingFrames--;
           }
@@ -1696,8 +1792,53 @@ export default function App() {
               </div>
             )}
 
+            {/* Выбор микрофона (Input Device Selector) */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "4px 10px",
+                borderRadius: 8,
+                background: "rgba(255, 255, 255, 0.05)",
+                border: "1px solid rgba(255, 255, 255, 0.1)",
+              }}
+              title="Выбор микрофона (Устройство ввода)"
+            >
+              <Mic size={14} color="#bef264" />
+              <select
+                value={selectedAudioDeviceId}
+                onChange={(e) => handleAudioDeviceChange(e.target.value)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "rgba(255, 255, 255, 0.9)",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  outline: "none",
+                  cursor: "pointer",
+                  maxWidth: 150,
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {audioDevices.length === 0 ? (
+                  <option value="" style={{ background: "#0e1017", color: "#fff" }}>Микрофон (По умолчанию)</option>
+                ) : (
+                  audioDevices.map((d, idx) => (
+                    <option key={d.deviceId || idx} value={d.deviceId} style={{ background: "#0e1017", color: "#fff" }}>
+                      {d.label || `Микрофон ${idx + 1}`}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+
             <button
-              onClick={() => setRnnoiseActive(!rnnoiseActive)}
+              onClick={() => {
+                const next = !rnnoiseActive;
+                setRnnoiseActive(next);
+                rnnoiseActiveRef.current = next;
+              }}
               style={{
                 display: "flex",
                 alignItems: "center",
