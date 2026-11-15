@@ -60,24 +60,39 @@ db.exec(`
 
 
 
+const JWT_SECRET = process.env.JWT_SECRET || "squadwave_secret_key_change_me_in_production";
+
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
 
 function generateToken(userId) {
-  return Buffer.from(JSON.stringify({ userId, exp: Date.now() + 7 * 24 * 3600 * 1000 })).toString("base64");
+  const payload = Buffer.from(JSON.stringify({ userId, exp: Date.now() + 7 * 24 * 3600 * 1000 })).toString("base64url");
+  const signature = crypto.createHmac("sha256", JWT_SECRET).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
 }
 
 function parseToken(authHeader) {
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  try {
-    const raw = Buffer.from(authHeader.slice(7), "base64").toString("utf-8");
-    const data = JSON.parse(raw);
-    if (data.exp < Date.now()) return null;
-    return data.userId;
-  } catch (e) {
-    return null;
+  const token = authHeader.slice(7).trim();
+  const parts = token.split(".");
+  if (parts.length === 2) {
+    const [payloadB64, signature] = parts;
+    const expectedSig = crypto.createHmac("sha256", JWT_SECRET).update(payloadB64).digest("base64url");
+    if (signature === expectedSig) {
+      try {
+        const data = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
+        if (data.exp >= Date.now()) return data.userId;
+      } catch {}
+    }
   }
+  // Совместимость с legacy базовыми токенами
+  try {
+    const raw = Buffer.from(token, "base64").toString("utf-8");
+    const data = JSON.parse(raw);
+    if (data.exp >= Date.now()) return data.userId;
+  } catch {}
+  return null;
 }
 
 // ==========================================

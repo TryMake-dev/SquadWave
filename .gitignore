@@ -15,8 +15,13 @@ sfu-server
 # Logs & temp
 *.log
 .DS_Store
+.env
 .env.local
+.env.*.local
+!.env.example
 
+# Temporary test crops & profile
 chrome_test_profile
 test_cdp.mjs
+web/crop_*.png
 
