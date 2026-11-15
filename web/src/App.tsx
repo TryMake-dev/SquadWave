@@ -69,6 +69,7 @@ interface VoicePeer {
   display_name: string;
   avatar_color: string;
   isSpeaking?: boolean;
+  isMuted?: boolean;
   volume?: number;
 }
 
@@ -107,6 +108,8 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const isMutedRef = useRef(false);
   isMutedRef.current = isMuted;
+
+  const [isSelfSpeaking, setIsSelfSpeaking] = useState(false);
 
   const [isDeafened, setIsDeafened] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -411,7 +414,18 @@ export default function App() {
             setVoicePeers((prev) =>
               prev.map((p) =>
                 p.clientId === msg.clientId
-                  ? { ...p, isSpeaking: msg.isSpeaking, volume: msg.volume }
+                  ? { ...p, isSpeaking: p.isMuted ? false : msg.isSpeaking, volume: msg.volume }
+                  : p
+              )
+            );
+            break;
+
+          // Состояние микрофона другого пользователя
+          case "voice_mute_state":
+            setVoicePeers((prev) =>
+              prev.map((p) =>
+                p.clientId === msg.clientId
+                  ? { ...p, isMuted: msg.isMuted, isSpeaking: msg.isMuted ? false : p.isSpeaking }
                   : p
               )
             );
@@ -484,10 +498,10 @@ export default function App() {
     };
   }, [currentUser?.id, authToken]);
 
-  // Студийный аудиотракт: захват микрофона, шумоподавление и Web Audio DSP
+  // Захват чистого микрофона и VAD индикация речи
   const startAudioCapture = async () => {
     try {
-      const rawStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -498,92 +512,100 @@ export default function App() {
         video: false,
       });
 
-      // Создаем Web Audio контекст для студийной фильтрации
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
-      audioContextRef.current = ctx;
+      localStreamRef.current = stream;
 
-      const micSource = ctx.createMediaStreamSource(rawStream);
-
-      // Highpass фильтр 85 Гц — полностью вырезает низкочастотный гул микрофона, кондиционеров и вибрации стола
-      const highpass = ctx.createBiquadFilter();
-      highpass.type = "highpass";
-      highpass.frequency.value = 85;
-
-      // DynamicsCompressor — автоматически выравнивает громкость, убирает хрипы и выравнивает тихий/громкий голос
-      const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -24;
-      compressor.knee.value = 30;
-      compressor.ratio.value = 3;
-      compressor.attack.value = 0.003;
-      compressor.release.value = 0.25;
-
-      // Destination стрим, треки которого отправляются по WebRTC
-      const destination = ctx.createMediaStreamDestination();
-      micSource.connect(highpass);
-      highpass.connect(compressor);
-      compressor.connect(destination);
-
-      // AnalyserNode для VAD (детекции речи)
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 128;
-      compressor.connect(analyser);
-
-      const processedStream = destination.stream;
-      localStreamRef.current = processedStream;
-      (processedStream as any)._raw = rawStream;
-
-      // Плавная индикация речи с гистерезисом 300мс (не дрожит UI и не прерывает голос)
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      let speakingFrames = 0;
-      let wasSpeaking = false;
-
-      const vadInterval = setInterval(() => {
-        if (!audioContextRef.current || ctx.state === "closed") {
-          clearInterval(vadInterval);
-          return;
+      // Web Audio API анализатор для детекции речи (НЕ блокирует и не портит аудио-поток WebRTC!)
+      try {
+        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
+        audioContextRef.current = ctx;
+        if (ctx.state === "suspended") {
+          ctx.resume().catch(() => {});
         }
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-        const avg = sum / dataArray.length;
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 64;
+        source.connect(analyser);
 
-        if (avg > 18 && !isMutedRef.current) {
-          speakingFrames = 5; // держим статус 300мс
-        } else if (speakingFrames > 0) {
-          speakingFrames--;
-        }
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let speakingFrames = 0;
+        let wasSpeaking = false;
 
-        const isSpeaking = speakingFrames > 0;
-        if (isSpeaking !== wasSpeaking) {
-          wasSpeaking = isSpeaking;
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
-              JSON.stringify({
-                type: "voice_speaking",
-                isSpeaking,
-                volume: Math.min(100, Math.round(avg * 2)),
-              })
-            );
+        const vadInterval = setInterval(() => {
+          if (!audioContextRef.current || ctx.state === "closed") {
+            clearInterval(vadInterval);
+            return;
           }
-        }
-      }, 60);
 
-      return processedStream;
+          if (isMutedRef.current) {
+            if (wasSpeaking) {
+              wasSpeaking = false;
+              setIsSelfSpeaking(false);
+              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({ type: "voice_speaking", isSpeaking: false, volume: 0 }));
+              }
+            }
+            return;
+          }
+
+          analyser.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+          const avg = sum / dataArray.length;
+
+          if (avg > 15) {
+            speakingFrames = 5; // удержание 300мс
+          } else if (speakingFrames > 0) {
+            speakingFrames--;
+          }
+
+          const isSpeaking = speakingFrames > 0;
+          if (isSpeaking !== wasSpeaking) {
+            wasSpeaking = isSpeaking;
+            setIsSelfSpeaking(isSpeaking);
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  type: "voice_speaking",
+                  isSpeaking,
+                  volume: Math.min(100, Math.round(avg * 2)),
+                })
+              );
+            }
+          }
+        }, 60);
+      } catch (err) {
+        console.warn("Audio analyser error:", err);
+      }
+
+      return stream;
     } catch (err) {
       console.warn("[Media] Ошибка захвата микрофона:", err);
       return null;
     }
   };
 
-  // Управление заглушением микрофона
-  useEffect(() => {
+  // Переключение микрофона (Mute / Unmute) с синхронизацией по WebSocket
+  const toggleMute = () => {
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    isMutedRef.current = nextMuted;
+
     if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !isMuted));
-      if ((localStreamRef.current as any)._raw) {
-        ((localStreamRef.current as any)._raw as MediaStream).getAudioTracks().forEach((t) => (t.enabled = !isMuted));
+      localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !nextMuted));
+    }
+
+    if (nextMuted) {
+      setIsSelfSpeaking(false);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "voice_speaking", isSpeaking: false, volume: 0 }));
+        wsRef.current.send(JSON.stringify({ type: "voice_mute_state", isMuted: true }));
+      }
+    } else {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "voice_mute_state", isMuted: false }));
       }
     }
-  }, [isMuted]);
+  };
 
   // Управление наушниками (deafen)
   useEffect(() => {
@@ -1256,7 +1278,7 @@ export default function App() {
                                 key={p.clientId + p.userId}
                                 style={{
                                   fontSize: 12,
-                                  color: isMe ? "#bef264" : p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.7)",
+                                  color: isMe ? "#bef264" : (p.isSpeaking && !p.isMuted) ? "#bef264" : "rgba(255,255,255,0.7)",
                                   display: "flex",
                                   alignItems: "center",
                                   gap: 6,
@@ -1275,8 +1297,8 @@ export default function App() {
                                     display: "flex",
                                     alignItems: "center",
                                     justifyContent: "center",
-                                    border: p.isSpeaking ? "2px solid #bef264" : "none",
-                                    boxShadow: p.isSpeaking ? "0 0 6px #bef264" : "none",
+                                    border: (isMe ? isSelfSpeaking : (p.isSpeaking && !p.isMuted)) ? "2px solid #bef264" : "none",
+                                    boxShadow: (isMe ? isSelfSpeaking : (p.isSpeaking && !p.isMuted)) ? "0 0 6px #bef264" : "none",
                                   }}
                                 >
                                   {p.display_name[0].toUpperCase()}
@@ -1284,7 +1306,7 @@ export default function App() {
                                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                                   {p.display_name}
                                 </span>
-                                {isMe && isMuted && <MicOff size={11} color="#ef4444" />}
+                                {(isMe ? isMuted : p.isMuted) && <MicOff size={11} color="#ef4444" />}
                               </div>
                             );
                           })}
@@ -1357,7 +1379,7 @@ export default function App() {
 
           <div style={{ display: "flex", gap: 4 }}>
             <button
-              onClick={() => setIsMuted(!isMuted)}
+              onClick={toggleMute}
               title={isMuted ? "Включить микрофон" : "Заглушить микрофон"}
               style={{
                 width: 30,
@@ -1569,15 +1591,12 @@ export default function App() {
                       ref={(el) => {
                         if (el && el.srcObject !== remoteScreenStream) {
                           el.srcObject = remoteScreenStream;
-                          el.play().catch((err) => {
-                            console.warn("[WebRTC Video] Fallback to muted playback:", err);
-                            el.muted = true;
-                            el.play().catch(console.warn);
-                          });
+                          el.play().catch(console.warn);
                         }
                       }}
                       autoPlay
                       playsInline
+                      muted
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
                   )}
@@ -1594,12 +1613,18 @@ export default function App() {
                   padding: 16,
                   borderRadius: 14,
                   background: "rgba(255, 255, 255, 0.03)",
-                  border: isMuted ? "1px solid rgba(255, 255, 255, 0.08)" : "1px solid rgba(190, 242, 100, 0.4)",
+                  border: isMuted
+                    ? "1px solid rgba(255, 255, 255, 0.08)"
+                    : isSelfSpeaking
+                    ? "2px solid #bef264"
+                    : "1px solid rgba(190, 242, 100, 0.4)",
+                  boxShadow: !isMuted && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
                   display: "flex",
                   flexDirection: "column",
                   alignItems: "center",
                   justifyContent: "center",
                   gap: 8,
+                  transition: "all 0.15s ease",
                 }}
               >
                 <div
@@ -1614,58 +1639,68 @@ export default function App() {
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
+                    border: !isMuted && isSelfSpeaking ? "2px solid #bef264" : "none",
+                    boxShadow: !isMuted && isSelfSpeaking ? "0 0 20px #bef264" : "none",
                   }}
                 >
                   {currentUser.display_name[0].toUpperCase()}
                 </div>
                 <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
-                <div style={{ fontSize: 11, color: isMuted ? "#ef4444" : "#bef264" }}>
-                  {isMuted ? "Микрофон выкл" : "В сети"}
+                <div style={{ fontSize: 11, color: isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)" }}>
+                  {isMuted ? "Микрофон выкл" : isSelfSpeaking ? "Говорит 🔊" : "В сети"}
                 </div>
               </div>
 
               {/* Удаленные участники (светятся при речи и воспроизводят звук!) */}
-              {voicePeers.map((peer) => (
-                <div
-                  key={peer.clientId}
-                  style={{
-                    width: 180,
-                    padding: 16,
-                    borderRadius: 14,
-                    background: "rgba(255, 255, 255, 0.03)",
-                    border: peer.isSpeaking ? `2px solid ${peer.avatar_color}` : "1px solid rgba(255, 255, 255, 0.08)",
-                    boxShadow: peer.isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: 8,
-                    transition: "all 0.15s ease",
-                  }}
-                >
+              {voicePeers.map((peer) => {
+                const isSpeaking = peer.isSpeaking && !peer.isMuted;
+                return (
                   <div
+                    key={peer.clientId}
                     style={{
-                      width: 58,
-                      height: 58,
-                      borderRadius: "50%",
-                      background: peer.avatar_color,
-                      color: "#090a0f",
-                      fontWeight: 900,
-                      fontSize: 24,
+                      width: 180,
+                      padding: 16,
+                      borderRadius: 14,
+                      background: "rgba(255, 255, 255, 0.03)",
+                      border: peer.isMuted
+                        ? "1px solid rgba(255, 255, 255, 0.08)"
+                        : isSpeaking
+                        ? `2px solid ${peer.avatar_color}`
+                        : "1px solid rgba(255, 255, 255, 0.08)",
+                      boxShadow: isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
                       display: "flex",
+                      flexDirection: "column",
                       alignItems: "center",
                       justifyContent: "center",
-                      boxShadow: peer.isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
+                      gap: 8,
+                      transition: "all 0.15s ease",
                     }}
                   >
-                    {peer.display_name[0].toUpperCase()}
+                    <div
+                      style={{
+                        width: 58,
+                        height: 58,
+                        borderRadius: "50%",
+                        background: peer.avatar_color,
+                        color: "#090a0f",
+                        fontWeight: 900,
+                        fontSize: 24,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
+                        boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
+                      }}
+                    >
+                      {peer.display_name[0].toUpperCase()}
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
+                    <div style={{ fontSize: 11, color: peer.isMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)" }}>
+                      {peer.isMuted ? "Микрофон выкл" : isSpeaking ? "Говорит 🔊" : "Слушает"}
+                    </div>
                   </div>
-                  <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
-                  <div style={{ fontSize: 11, color: peer.isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)" }}>
-                    {peer.isSpeaking ? "Говорит 🔊" : "Слушает"}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

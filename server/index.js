@@ -619,6 +619,20 @@ wss.on("connection", (ws, req) => {
               fromClientId: clientId,
               signal,
             }));
+          } else {
+            console.warn(`[WebRTC] Target ${targetClientId} not found or closed`);
+          }
+          break;
+        }
+
+        // Состояние микрофона (заглушен / включен)
+        case "voice_mute_state": {
+          if (clientInfo.currentVoiceChannel) {
+            broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
+              type: "voice_mute_state",
+              clientId,
+              isMuted: msg.isMuted,
+            }, clientId);
           }
           break;
         }
