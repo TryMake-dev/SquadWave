@@ -114,6 +114,9 @@ export default function App() {
   const [isSelfSpeaking, setIsSelfSpeaking] = useState(false);
 
   const [isDeafened, setIsDeafened] = useState(false);
+  const isDeafenedRef = useRef(false);
+  isDeafenedRef.current = isDeafened;
+  const playbackGainNodeRef = useRef<GainNode | null>(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const localScreenStreamRef = useRef<MediaStream | null>(null);
@@ -590,12 +593,21 @@ export default function App() {
 
           // Гарантированный живой звук через Web Audio PCM с защитой от треска и наслоения (Jitter Queue)
           case "voice_pcm": {
-            if (isDeafened) break;
+            if (isDeafenedRef.current) break;
             try {
               if (!playbackAudioCtxRef.current) {
-                playbackAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+                const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+                playbackAudioCtxRef.current = ctx;
+                const gain = ctx.createGain();
+                gain.gain.value = isDeafenedRef.current ? 0 : 1;
+                gain.connect(ctx.destination);
+                playbackGainNodeRef.current = gain;
               }
               const pCtx = playbackAudioCtxRef.current;
+              if (playbackGainNodeRef.current) {
+                playbackGainNodeRef.current.gain.value = isDeafenedRef.current ? 0 : 1;
+              }
+              if (isDeafenedRef.current) break;
               if (pCtx.state === "suspended") {
                 pCtx.resume().catch(() => {});
               }
@@ -611,7 +623,7 @@ export default function App() {
 
                 const source = pCtx.createBufferSource();
                 source.buffer = audioBuffer;
-                source.connect(pCtx.destination);
+                source.connect(playbackGainNodeRef.current || pCtx.destination);
 
                 // Бесшовное планирование времени воспроизведения без разрывов и наслоений
                 const now = pCtx.currentTime;
@@ -875,22 +887,60 @@ export default function App() {
     }
   };
 
-  // Управление наушниками (deafen)
+  // Управление наушниками (Deafen / Заглушить всех собеседников)
+  const toggleDeafen = () => {
+    const nextDeafened = !isDeafened;
+    setIsDeafened(nextDeafened);
+    isDeafenedRef.current = nextDeafened;
+
+    // Мгновенно глушим / включаем Web Audio PCM мастер-гейн
+    if (playbackGainNodeRef.current) {
+      playbackGainNodeRef.current.gain.value = nextDeafened ? 0 : 1;
+    }
+    if (playbackAudioCtxRef.current) {
+      if (nextDeafened) {
+        playbackAudioCtxRef.current.suspend().catch(() => {});
+      } else {
+        playbackAudioCtxRef.current.resume().catch(() => {});
+      }
+    }
+
+    // Мгновенно глушим / ставим на паузу все входящие WebRTC <audio> теги
+    document.querySelectorAll("audio").forEach((el) => {
+      el.muted = nextDeafened;
+      if (nextDeafened) {
+        el.pause();
+      } else {
+        el.play().catch(() => {});
+      }
+    });
+  };
+
   useEffect(() => {
-    const audioElements = document.querySelectorAll("audio");
-    audioElements.forEach((el) => {
+    isDeafenedRef.current = isDeafened;
+    if (playbackGainNodeRef.current) {
+      playbackGainNodeRef.current.gain.value = isDeafened ? 0 : 1;
+    }
+    document.querySelectorAll("audio").forEach((el) => {
       el.muted = isDeafened;
+      if (isDeafened) {
+        el.pause();
+      } else {
+        el.play().catch(() => {});
+      }
     });
   }, [isDeafened]);
 
   // Глобальная разблокировка Autoplay звука при любом клике пользователя в окне
   useEffect(() => {
     const unlockAutoplay = () => {
-      document.querySelectorAll("audio").forEach((el) => {
-        if (el.paused && el.srcObject) {
-          el.play().catch(() => {});
-        }
-      });
+      if (!isDeafenedRef.current) {
+        document.querySelectorAll("audio").forEach((el) => {
+          if (el.paused && el.srcObject) {
+            el.play().catch(() => {});
+          }
+        });
+      }
       if (audioContextRef.current && audioContextRef.current.state === "suspended") {
         audioContextRef.current.resume().catch(() => {});
       }
@@ -1754,8 +1804,8 @@ export default function App() {
               {isMuted ? <MicOff size={15} /> : <Mic size={15} />}
             </button>
             <button
-              onClick={() => setIsDeafened(!isDeafened)}
-              title={isDeafened ? "Включить звук" : "Заглушить звук"}
+              onClick={toggleDeafen}
+              title={isDeafened ? "Включить звук" : "Заглушить звук (Наушники)"}
               style={{
                 width: 30,
                 height: 30,
