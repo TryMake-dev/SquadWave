@@ -31,7 +31,8 @@ import {
   MessageSquare,
   Maximize2,
   Minimize2,
-  Tv
+  Tv,
+  HelpCircle
 } from "lucide-react";
 
 const API_BASE = window.location.hostname === "localhost" ? "http://localhost:3001" : "";
@@ -82,8 +83,20 @@ interface VoicePeer {
 
 export default function App() {
   // Авторизация
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(localStorage.getItem("squadwave_token"));
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => {
+    try {
+      const savedUser = localStorage.getItem("squadwave_user");
+      const token = localStorage.getItem("squadwave_token");
+      if (token && savedUser) {
+        return JSON.parse(savedUser);
+      }
+    } catch (e) {}
+    return null;
+  });
+  const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem("squadwave_token"));
+  const [isAuthChecking, setIsAuthChecking] = useState<boolean>(() => {
+    return !!localStorage.getItem("squadwave_token");
+  });
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -91,8 +104,23 @@ export default function App() {
   const [authError, setAuthError] = useState("");
 
   // Серверы и каналы
-  const [servers, setServers] = useState<ServerItem[]>([]);
-  const [activeServer, setActiveServer] = useState<ServerItem | null>(null);
+  const [servers, setServers] = useState<ServerItem[]>(() => {
+    try {
+      const saved = localStorage.getItem("squadwave_cached_servers");
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [];
+  });
+  const [activeServer, setActiveServer] = useState<ServerItem | null>(() => {
+    try {
+      const saved = localStorage.getItem("squadwave_cached_servers");
+      if (saved) {
+        const list = JSON.parse(saved);
+        if (list && list.length > 0) return list[0];
+      }
+    } catch (e) {}
+    return null;
+  });
   const [channels, setChannels] = useState<ChannelItem[]>([]);
   const [activeChannel, setActiveChannel] = useState<ChannelItem | null>(null);
 
@@ -230,7 +258,10 @@ export default function App() {
 
   // 1. Проверка сессии
   useEffect(() => {
-    if (!authToken) return;
+    if (!authToken) {
+      setIsAuthChecking(false);
+      return;
+    }
     fetch(`${API_BASE}/api/auth/me`, {
       headers: { Authorization: `Bearer ${authToken}` },
     })
@@ -238,11 +269,19 @@ export default function App() {
         if (!res.ok) throw new Error("Invalid session");
         return res.json();
       })
-      .then((data) => setCurrentUser(data.user))
+      .then((data) => {
+        setCurrentUser(data.user);
+        try {
+          localStorage.setItem("squadwave_user", JSON.stringify(data.user));
+        } catch (e) {}
+        setIsAuthChecking(false);
+      })
       .catch(() => {
         localStorage.removeItem("squadwave_token");
+        localStorage.removeItem("squadwave_user");
         setAuthToken(null);
         setCurrentUser(null);
+        setIsAuthChecking(false);
       });
   }, [authToken]);
 
@@ -252,9 +291,13 @@ export default function App() {
     fetch(`${API_BASE}/api/servers`)
       .then((res) => res.json())
       .then((data) => {
-        setServers(data.servers || []);
-        if (data.servers && data.servers.length > 0 && !activeServer) {
-          setActiveServer(data.servers[0]);
+        const srvs = data.servers || [];
+        setServers(srvs);
+        try {
+          localStorage.setItem("squadwave_cached_servers", JSON.stringify(srvs));
+        } catch (e) {}
+        if (srvs.length > 0 && !activeServer) {
+          setActiveServer(srvs[0]);
         }
       })
       .catch(console.error);
@@ -1359,8 +1402,12 @@ export default function App() {
       }
 
       localStorage.setItem("squadwave_token", data.token);
+      try {
+        localStorage.setItem("squadwave_user", JSON.stringify(data.user));
+      } catch (e) {}
       setAuthToken(data.token);
       setCurrentUser(data.user);
+      setIsAuthChecking(false);
     } catch (e: any) {
       setAuthError("Не удалось подключиться к серверу SquadWave");
     }
@@ -1368,10 +1415,52 @@ export default function App() {
 
   const handleLogout = () => {
     localStorage.removeItem("squadwave_token");
+    localStorage.removeItem("squadwave_user");
+    localStorage.removeItem("squadwave_cached_servers");
     setAuthToken(null);
     setCurrentUser(null);
     setIsInVoice(false);
+    setIsAuthChecking(false);
   };
+
+  // Экран ожидания сессии: предотвращает мелькание формы входа при перезагрузке страницы
+  if (isAuthChecking && !currentUser) {
+    return (
+      <div
+        style={{
+          width: "100vw",
+          height: "100vh",
+          background: "#080a0f",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "'Inter', sans-serif",
+          color: "#ffffff",
+          gap: 16,
+        }}
+      >
+        <div
+          style={{
+            width: 52,
+            height: 52,
+            borderRadius: 16,
+            background: "#bef264",
+            color: "#090a0f",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxShadow: "0 0 35px rgba(190, 242, 100, 0.4)",
+          }}
+        >
+          <Zap size={28} fill="#090a0f" />
+        </div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.6)", letterSpacing: 0.5 }}>
+          Подключение к SquadWave...
+        </div>
+      </div>
+    );
+  }
 
   // ==========================================
   // ЭКРАН 1: ВХОД И РЕГИСТРАЦИЯ
@@ -2156,6 +2245,27 @@ export default function App() {
               <Sparkles size={14} />
               <span>Саммари</span>
             </button>
+
+            <button
+              onClick={() => setShowSettingsModal(true)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "6px 12px",
+                borderRadius: 8,
+                background: "rgba(255, 255, 255, 0.06)",
+                border: "1px solid rgba(255, 255, 255, 0.12)",
+                color: "rgba(255, 255, 255, 0.8)",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+              title="Настройки звука и микрофона"
+            >
+              <Settings size={14} />
+              <span>Настройки</span>
+            </button>
           </div>
         </div>
 
@@ -2897,7 +3007,12 @@ export default function App() {
 
       {/* МОДАЛКА: НАСТРОЙКИ ЗВУКА И ВИДЕО (DISCORD & NVIDIA BROADCAST STYLE) */}
       {showSettingsModal && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowSettingsModal(false);
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}
+        >
           <div style={{ width: 560, background: "#0e111a", borderRadius: 18, border: "1px solid rgba(255,255,255,0.12)", padding: 26, boxShadow: "0 25px 60px rgba(0,0,0,0.6)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
