@@ -1,17 +1,16 @@
-FROM golang:1.21-alpine AS builder
+FROM node:22-alpine
 
 WORKDIR /app
-COPY go.mod ./
-RUN go mod download || true
 
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o sfu-server main.go
+# Копируем зависимости сервера
+COPY server/package*.json ./server/
+RUN cd server && npm install --production
 
-FROM alpine:latest
-WORKDIR /root/
-COPY --from=builder /app/sfu-server .
+# Копируем исходники сервера и скомпилированный фронтенд
+COPY server/ ./server/
+COPY web/dist ./web/dist
 
-EXPOSE 8443
-EXPOSE 50000-50100/udp
+EXPOSE 3001
 
-CMD ["./sfu-server"]
+WORKDIR /app/server
+CMD ["node", "index.js"]

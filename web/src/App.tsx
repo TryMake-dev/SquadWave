@@ -23,149 +23,238 @@ import {
   Zap,
   Shield,
   X,
-  Play,
-  Maximize2
+  LogOut,
+  User,
+  Key,
+  MessageSquare
 } from "lucide-react";
 
-interface Peer {
+const API_BASE = window.location.hostname === "localhost" ? "http://localhost:3001" : "";
+const WS_BASE = window.location.hostname === "localhost" ? "ws://localhost:3001" : `ws://${window.location.host}`;
+
+interface AuthUser {
   id: string;
-  name: string;
-  role: string;
-  isSpeaking: boolean;
-  isMuted: boolean;
-  isDeafened: boolean;
-  isScreenSharing: boolean;
-  avatarColor: string;
-  avatarLetter: string;
-  volume: number;
-  ping: number;
+  username: string;
+  display_name: string;
+  avatar_color: string;
 }
 
-interface ChatMessage {
+interface ServerItem {
   id: string;
-  sender: string;
-  senderColor: string;
-  avatarLetter: string;
-  time: string;
-  text: string;
+  name: string;
+  icon: string;
+  owner_id: string;
+}
+
+interface ChannelItem {
+  id: string;
+  server_id: string;
+  name: string;
+  type: "text" | "voice";
+}
+
+interface MessageItem {
+  id: string;
+  channel_id: string;
+  user_id: string;
+  display_name: string;
+  avatar_color: string;
+  content: string;
+  created_at: number;
+}
+
+interface VoicePeer {
+  clientId: string;
+  userId: string;
+  display_name: string;
+  avatar_color: string;
+  isSpeaking?: boolean;
+  volume?: number;
 }
 
 export default function App() {
-  // Навигация
-  const [activeTab, setActiveTab] = useState<"voice" | "text">("voice");
-  const [activeTextChannel, setActiveTextChannel] = useState("general-chat");
-  const [activeVoiceChannel, setActiveVoiceChannel] = useState("Рейд войс [Pion SFU]");
+  // Авторизация
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(localStorage.getItem("squadwave_token"));
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authError, setAuthError] = useState("");
 
-  // Состояния войса
-  const [isInVoice, setIsInVoice] = useState(true);
+  // Серверы и каналы
+  const [servers, setServers] = useState<ServerItem[]>([]);
+  const [activeServer, setActiveServer] = useState<ServerItem | null>(null);
+  const [channels, setChannels] = useState<ChannelItem[]>([]);
+  const [activeChannel, setActiveChannel] = useState<ChannelItem | null>(null);
+
+  // Сообщения чата
+  const [messages, setMessages] = useState<MessageItem[]>([]);
+  const [messageInput, setMessageInput] = useState("");
+
+  // Голосовая связь и WebRTC
+  const [isInVoice, setIsInVoice] = useState(false);
+  const [activeVoiceChannel, setActiveVoiceChannel] = useState<ChannelItem | null>(null);
+  const [voicePeers, setVoicePeers] = useState<VoicePeer[]>([]);
   const [isMuted, setIsMuted] = useState(false);
   const [isDeafened, setIsDeafened] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [rnnoiseActive, setRnnoiseActive] = useState(true);
-  const [showSummaryModal, setShowSummaryModal] = useState(false);
-  const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [pwaInstalled, setPwaInstalled] = useState(false);
   const [ping, setPing] = useState(18);
 
-  // Стрим экрана
+  // Модальные окна
+  const [showCreateServerModal, setShowCreateServerModal] = useState(false);
+  const [showCreateChannelModal, setShowCreateChannelModal] = useState(false);
+  const [newServerName, setNewServerName] = useState("");
+  const [newChannelName, setNewChannelName] = useState("");
+  const [newChannelType, setNewChannelType] = useState<"text" | "voice">("text");
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  // Рефы
+  const wsRef = useRef<WebSocket | null>(null);
+  const myClientIdRef = useRef<string | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
-
-  // Микрофон и анализатор звука
   const audioContextRef = useRef<AudioContext | null>(null);
-  const localAudioStreamRef = useRef<MediaStream | null>(null);
-  const animFrameRef = useRef<number | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Сообщения чата
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "1",
-      sender: "Кирилл (Carry)",
-      senderColor: "#38bdf8",
-      avatarLetter: "К",
-      time: "18:42",
-      text: "Здорово всем! Проверил пинг на нашем сервере за $3 — ровно 18 миллисекунд, звук идеальный!",
-    },
-    {
-      id: "2",
-      sender: "Максим (Support)",
-      senderColor: "#a855f7",
-      avatarLetter: "М",
-      time: "18:43",
-      text: "Да, после вечного RTC Connecting в Дискорде это просто небо и земля. Включаю стрим экрана.",
-    },
-    {
-      id: "3",
-      sender: "Александр (Dev)",
-      senderColor: "#bef264",
-      avatarLetter: "А",
-      time: "18:45",
-      text: "RNNoise шумодав на Wasm уже работает. Кликов синих свичей на механике вообще не слышно.",
-    },
-  ]);
-  const [inputText, setInputText] = useState("");
-
-  // Список участников комнаты
-  const [peers, setPeers] = useState<Peer[]>([
-    {
-      id: "local",
-      name: "Александр (Вы)",
-      role: "Host / Architect",
-      isSpeaking: false,
-      isMuted: false,
-      isDeafened: false,
-      isScreenSharing: false,
-      avatarColor: "#bef264",
-      avatarLetter: "А",
-      volume: 0,
-      ping: 18,
-    },
-    {
-      id: "p2",
-      name: "Кирилл",
-      role: "Carry Player",
-      isSpeaking: true,
-      isMuted: false,
-      isDeafened: false,
-      isScreenSharing: false,
-      avatarColor: "#38bdf8",
-      avatarLetter: "К",
-      volume: 68,
-      ping: 21,
-    },
-    {
-      id: "p3",
-      name: "Максим",
-      role: "Support",
-      isSpeaking: false,
-      isMuted: false,
-      isDeafened: false,
-      isScreenSharing: false,
-      avatarColor: "#a855f7",
-      avatarLetter: "М",
-      volume: 12,
-      ping: 19,
-    },
-    {
-      id: "p4",
-      name: "Артём",
-      role: "Mid Laner",
-      isSpeaking: false,
-      isMuted: true,
-      isDeafened: false,
-      isScreenSharing: false,
-      avatarColor: "#f59e0b",
-      avatarLetter: "А",
-      volume: 0,
-      ping: 24,
-    },
-  ]);
-
-  // Запуск микрофона с реальным AudioContext Web Audio API
+  // 1. Проверка текущей сессии
   useEffect(() => {
-    let active = true;
+    if (!authToken) return;
+    fetch(`${API_BASE}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error("Invalid session");
+        return res.json();
+      })
+      .then((data) => setCurrentUser(data.user))
+      .catch(() => {
+        localStorage.removeItem("squadwave_token");
+        setAuthToken(null);
+        setCurrentUser(null);
+      });
+  }, [authToken]);
 
-    async function initAudio() {
+  // 2. Загрузка списка серверов
+  useEffect(() => {
+    if (!currentUser) return;
+    fetch(`${API_BASE}/api/servers`)
+      .then((res) => res.json())
+      .then((data) => {
+        setServers(data.servers || []);
+        if (data.servers && data.servers.length > 0 && !activeServer) {
+          setActiveServer(data.servers[0]);
+        }
+      })
+      .catch(console.error);
+  }, [currentUser]);
+
+  // 3. Загрузка каналов при смене сервера
+  useEffect(() => {
+    if (!activeServer) return;
+    fetch(`${API_BASE}/api/servers/${activeServer.id}/channels`)
+      .then((res) => res.json())
+      .then((data) => {
+        const list: ChannelItem[] = data.channels || [];
+        setChannels(list);
+        const firstText = list.find((c) => c.type === "text");
+        if (firstText) setActiveChannel(firstText);
+      })
+      .catch(console.error);
+  }, [activeServer]);
+
+  // 4. Загрузка сообщений при смене текстового канала
+  useEffect(() => {
+    if (!activeChannel || activeChannel.type !== "text") return;
+    fetch(`${API_BASE}/api/channels/${activeChannel.id}/messages`)
+      .then((res) => res.json())
+      .then((data) => setMessages(data.messages || []))
+      .catch(console.error);
+  }, [activeChannel]);
+
+  // Прокрутка чата вниз
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // 5. Подключение к WebSocket
+  useEffect(() => {
+    if (!currentUser || !authToken) return;
+
+    const ws = new WebSocket(`${WS_BASE}?token=${authToken}`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("[WS] Подключение установлено к SquadWave Real-Time Gateway");
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+          case "init":
+            myClientIdRef.current = msg.clientId;
+            break;
+
+          case "chat_message":
+            if (activeChannel && msg.message.channel_id === activeChannel.id) {
+              setMessages((prev) => {
+                if (prev.some((m) => m.id === msg.message.id)) return prev;
+                return [...prev, msg.message];
+              });
+            }
+            break;
+
+          case "voice_room_peers":
+            setVoicePeers(msg.peers || []);
+            break;
+
+          case "voice_peer_joined":
+            setVoicePeers((prev) => {
+              if (prev.some((p) => p.clientId === msg.peer.clientId)) return prev;
+              return [...prev, msg.peer];
+            });
+            break;
+
+          case "voice_peer_left":
+            setVoicePeers((prev) => prev.filter((p) => p.clientId !== msg.clientId));
+            break;
+
+          case "voice_speaking":
+            setVoicePeers((prev) =>
+              prev.map((p) =>
+                p.clientId === msg.clientId
+                  ? { ...p, isSpeaking: msg.isSpeaking, volume: msg.volume }
+                  : p
+              )
+            );
+            break;
+        }
+      } catch (e) {
+        console.error("[WS] Ошибка парсинга:", e);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("[WS] Соединение закрыто");
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [currentUser, authToken, activeChannel]);
+
+  // 6. Аудиоанализатор и локальная детекция голоса
+  useEffect(() => {
+    if (!isInVoice || !activeVoiceChannel) return;
+
+    let active = true;
+    let animId: number;
+
+    async function startAudio() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -175,7 +264,7 @@ export default function App() {
           },
         });
         if (!active) return;
-        localAudioStreamRef.current = stream;
+        localStreamRef.current = stream;
 
         const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
         audioContextRef.current = ctx;
@@ -185,59 +274,105 @@ export default function App() {
         source.connect(analyser);
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let wasSpeaking = false;
 
-        const trackVolume = () => {
+        const loop = () => {
           if (!active) return;
           analyser.getByteFrequencyData(dataArray);
           let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
           const avg = sum / dataArray.length;
           const speaking = avg > 20 && !isMuted;
 
-          setPeers((prev) =>
-            prev.map((p) =>
-              p.id === "local"
-                ? { ...p, isSpeaking: speaking, volume: Math.min(100, avg * 2.5) }
-                : p
-            )
-          );
-          animFrameRef.current = requestAnimationFrame(trackVolume);
+          if (speaking !== wasSpeaking && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wasSpeaking = speaking;
+            wsRef.current.send(
+              JSON.stringify({
+                type: "voice_speaking",
+                isSpeaking: speaking,
+                volume: Math.min(100, avg * 2),
+              })
+            );
+          }
+
+          animId = requestAnimationFrame(loop);
         };
-        trackVolume();
+        loop();
       } catch (err) {
-        // Фоновый генератор для превью если микрофон не разрешен
-        const interval = setInterval(() => {
-          if (!active) return;
-          const speaking = Math.random() > 0.65 && !isMuted;
-          setPeers((prev) =>
-            prev.map((p) =>
-              p.id === "p2"
-                ? { ...p, isSpeaking: Math.random() > 0.3, volume: Math.floor(Math.random() * 80) }
-                : p
-            )
-          );
-        }, 1200);
-        return () => clearInterval(interval);
+        console.warn("Микрофон недоступен:", err);
       }
     }
 
-    if (isInVoice) {
-      initAudio();
-    }
+    startAudio();
 
     return () => {
       active = false;
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      if (localAudioStreamRef.current) {
-        localAudioStreamRef.current.getTracks().forEach((t) => t.stop());
+      if (animId) cancelAnimationFrame(animId);
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
       if (audioContextRef.current) audioContextRef.current.close();
     };
-  }, [isInVoice, isMuted, rnnoiseActive]);
+  }, [isInVoice, activeVoiceChannel, isMuted, rnnoiseActive]);
 
-  // Включение шеринга экрана 1080p 60fps
+  // Вход / регистрация
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+
+    const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+    const payload =
+      authMode === "login"
+        ? { username: authUsername, password: authPassword }
+        : { username: authUsername, password: authPassword, display_name: authDisplayName };
+
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "Ошибка авторизации");
+        return;
+      }
+
+      localStorage.setItem("squadwave_token", data.token);
+      setAuthToken(data.token);
+      setCurrentUser(data.user);
+    } catch (e: any) {
+      setAuthError("Не удалось подключиться к серверу SquadWave");
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("squadwave_token");
+    setAuthToken(null);
+    setCurrentUser(null);
+    setIsInVoice(false);
+  };
+
+  // Вход в голосовую комнату
+  const joinVoiceChannel = (channel: ChannelItem) => {
+    setActiveVoiceChannel(channel);
+    setIsInVoice(true);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "voice_join", channelId: channel.id }));
+    }
+  };
+
+  const leaveVoiceChannel = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "voice_leave" }));
+    }
+    setIsInVoice(false);
+    setActiveVoiceChannel(null);
+    setVoicePeers([]);
+    if (isScreenSharing) toggleScreenShare();
+  };
+
+  // Шеринг экрана
   const toggleScreenShare = async () => {
     if (isScreenSharing) {
       if (screenStreamRef.current) {
@@ -251,45 +386,278 @@ export default function App() {
 
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          frameRate: { ideal: 60 },
-        },
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
         audio: true,
       });
-
       screenStreamRef.current = stream;
-      if (screenVideoRef.current) {
-        screenVideoRef.current.srcObject = stream;
-      }
+      if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
       setIsScreenSharing(true);
-
-      stream.getVideoTracks()[0].onended = () => {
-        setIsScreenSharing(false);
-      };
+      stream.getVideoTracks()[0].onended = () => setIsScreenSharing(false);
     } catch (e) {
       console.warn("Screen share cancelled:", e);
     }
   };
 
-  // Отправка текстового сообщения
-  const handleSendMessage = (e: React.FormEvent) => {
+  // Отправка сообщения
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim()) return;
+    if (!messageInput.trim() || !activeChannel || !authToken) return;
 
-    const newMsg: ChatMessage = {
-      id: Date.now().toString(),
-      sender: "Александр (Вы)",
-      senderColor: "#bef264",
-      avatarLetter: "А",
-      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      text: inputText.trim(),
-    };
-    setMessages((prev) => [...prev, newMsg]);
-    setInputText("");
+    try {
+      await fetch(`${API_BASE}/api/channels/${activeChannel.id}/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ content: messageInput.trim() }),
+      });
+      setMessageInput("");
+    } catch (e) {
+      console.error("Failed to send message:", e);
+    }
   };
 
+  // Создание сервера
+  const handleCreateServer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newServerName.trim() || !authToken) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/servers`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ name: newServerName.trim() }),
+      });
+      const data = await res.json();
+      if (data.server) {
+        setServers((prev) => [...prev, data.server]);
+        setActiveServer(data.server);
+        setShowCreateServerModal(false);
+        setNewServerName("");
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Создание канала
+  const handleCreateChannel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newChannelName.trim() || !activeServer || !authToken) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/servers/${activeServer.id}/channels`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ name: newChannelName.trim(), type: newChannelType }),
+      });
+      const data = await res.json();
+      if (data.channel) {
+        setChannels((prev) => [...prev, data.channel]);
+        if (data.channel.type === "text") setActiveChannel(data.channel);
+        setShowCreateChannelModal(false);
+        setNewChannelName("");
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // ==========================================
+  // ЭКРАН 1: ВХОД И РЕГИСТРАЦИЯ
+  // ==========================================
+  if (!currentUser) {
+    return (
+      <div
+        style={{
+          width: "100vw",
+          height: "100vh",
+          background: "#080a0f",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "'Inter', sans-serif",
+          color: "#ffffff",
+        }}
+      >
+        <div
+          style={{
+            width: 440,
+            background: "#10131d",
+            borderRadius: 22,
+            border: "1px solid rgba(255, 255, 255, 0.12)",
+            boxShadow: "0 30px 90px rgba(0, 0, 0, 0.9)",
+            padding: "36px 32px",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          {/* Логотип SquadWave */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            <div
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: 14,
+                background: "#bef264",
+                color: "#090a0f",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow: "0 0 20px rgba(190, 242, 100, 0.4)",
+              }}
+            >
+              <Zap size={24} fill="#090a0f" />
+            </div>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 900, letterSpacing: "-0.02em" }}>SquadWave</div>
+              <div style={{ fontSize: 12, color: "rgba(255, 255, 255, 0.4)" }}>Self-Hosted WebRTC Discord Alternative</div>
+            </div>
+          </div>
+
+          <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 6px 0" }}>
+            {authMode === "login" ? "С возвращением!" : "Создать аккаунт"}
+          </h2>
+          <p style={{ fontSize: 13, color: "rgba(255, 255, 255, 0.5)", margin: "0 0 24px 0" }}>
+            {authMode === "login"
+              ? "Войдите со своим именем пользователя и паролем"
+              : "Данные сохраняются в защищённую локальную базу SQLite"}
+          </p>
+
+          {authError && (
+            <div
+              style={{
+                padding: "10px 14px",
+                borderRadius: 8,
+                background: "rgba(239, 68, 68, 0.15)",
+                border: "1px solid #ef4444",
+                color: "#ef4444",
+                fontSize: 13,
+                fontWeight: 600,
+                marginBottom: 16,
+              }}
+            >
+              {authError}
+            </div>
+          )}
+
+          <form onSubmit={handleAuthSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "rgba(255,255,255,0.6)", marginBottom: 6, display: "block" }}>
+                Имя пользователя (Логин)
+              </label>
+              <input
+                type="text"
+                required
+                value={authUsername}
+                onChange={(e) => setAuthUsername(e.target.value)}
+                placeholder="alex"
+                style={{
+                  width: "100%",
+                  padding: "12px 14px",
+                  borderRadius: 10,
+                  background: "rgba(255, 255, 255, 0.05)",
+                  border: "1px solid rgba(255, 255, 255, 0.1)",
+                  color: "#ffffff",
+                  fontSize: 14,
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            {authMode === "register" && (
+              <div>
+                <label style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "rgba(255,255,255,0.6)", marginBottom: 6, display: "block" }}>
+                  Отображаемое имя (Никнейм)
+                </label>
+                <input
+                  type="text"
+                  value={authDisplayName}
+                  onChange={(e) => setAuthDisplayName(e.target.value)}
+                  placeholder="Александр"
+                  style={{
+                    width: "100%",
+                    padding: "12px 14px",
+                    borderRadius: 10,
+                    background: "rgba(255, 255, 255, 0.05)",
+                    border: "1px solid rgba(255, 255, 255, 0.1)",
+                    color: "#ffffff",
+                    fontSize: 14,
+                    outline: "none",
+                  }}
+                />
+              </div>
+            )}
+
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "rgba(255,255,255,0.6)", marginBottom: 6, display: "block" }}>
+                Пароль
+              </label>
+              <input
+                type="password"
+                required
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                placeholder="••••••••"
+                style={{
+                  width: "100%",
+                  padding: "12px 14px",
+                  borderRadius: 10,
+                  background: "rgba(255, 255, 255, 0.05)",
+                  border: "1px solid rgba(255, 255, 255, 0.1)",
+                  color: "#ffffff",
+                  fontSize: 14,
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            <button
+              type="submit"
+              style={{
+                marginTop: 10,
+                padding: "12px",
+                borderRadius: 10,
+                background: "#bef264",
+                border: "none",
+                color: "#090a0f",
+                fontWeight: 900,
+                fontSize: 15,
+                cursor: "pointer",
+                transition: "opacity 0.2s",
+              }}
+            >
+              {authMode === "login" ? "Войти в систему" : "Зарегистрироваться"}
+            </button>
+          </form>
+
+          <div style={{ marginTop: 20, textAlign: "center", fontSize: 13, color: "rgba(255,255,255,0.5)" }}>
+            {authMode === "login" ? "Впервые в SquadWave? " : "Уже есть аккаунт? "}
+            <span
+              onClick={() => {
+                setAuthMode(authMode === "login" ? "register" : "login");
+                setAuthError("");
+              }}
+              style={{ color: "#bef264", fontWeight: 700, cursor: "pointer" }}
+            >
+              {authMode === "login" ? "Создать аккаунт" : "Войти"}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ==========================================
+  // ЭКРАН 2: ПОЛНОЦЕННЫЙ ИНТЕРФЕЙС SQUADWAVE
+  // ==========================================
   return (
     <div
       style={{
@@ -298,11 +666,11 @@ export default function App() {
         height: "100vh",
         background: "#080a0f",
         color: "#ffffff",
-        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
+        fontFamily: "'Inter', sans-serif",
         overflow: "hidden",
       }}
     >
-      {/* 1. БОКОВАЯ ПАНЕЛЬ СЕРВЕРОВ (Discord Style) */}
+      {/* 1. САЙДБАР СЕРВЕРОВ */}
       <div
         style={{
           width: 72,
@@ -316,7 +684,6 @@ export default function App() {
           zIndex: 10,
         }}
       >
-        {/* Главная иконка SquadWave */}
         <div
           title="SquadWave Home"
           style={{
@@ -328,11 +695,8 @@ export default function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            fontWeight: 900,
-            fontSize: 22,
+            boxShadow: "0 0 20px rgba(190, 242, 100, 0.4)",
             cursor: "pointer",
-            boxShadow: "0 0 20px rgba(190, 242, 100, 0.45)",
-            transition: "all 0.2s ease",
           }}
         >
           <Zap size={24} fill="#090a0f" />
@@ -340,69 +704,52 @@ export default function App() {
 
         <div style={{ width: 36, height: 2, background: "rgba(255, 255, 255, 0.1)", margin: "4px 0" }} />
 
-        {/* Сервер Squad Gaming HQ (Активный) */}
-        <div
-          title="Squad Gaming HQ"
-          style={{
-            width: 48,
-            height: 48,
-            borderRadius: 16,
-            background: "rgba(56, 189, 248, 0.2)",
-            border: "2px solid #38bdf8",
-            color: "#38bdf8",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontWeight: 800,
-            fontSize: 16,
-            cursor: "pointer",
-            position: "relative",
-          }}
-        >
-          HQ
-          {/* Индикатор активности */}
-          <div
-            style={{
-              position: "absolute",
-              left: -12,
-              width: 4,
-              height: 36,
-              background: "#ffffff",
-              borderRadius: "0 4px 4px 0",
-            }}
-          />
-        </div>
-
-        {/* Другие серверы */}
-        {[
-          { label: "DEV", color: "#a855f7", name: "Rust & Go SFU Devs" },
-          { label: "CYBER", color: "#f59e0b", name: "Cyberpunk Clan" },
-        ].map((srv, idx) => (
-          <div
-            key={idx}
-            title={srv.name}
-            style={{
-              width: 48,
-              height: 48,
-              borderRadius: 24,
-              background: "rgba(255, 255, 255, 0.04)",
-              color: srv.color,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontWeight: 800,
-              fontSize: 13,
-              cursor: "pointer",
-              transition: "border-radius 0.2s ease",
-            }}
-          >
-            {srv.label}
-          </div>
-        ))}
+        {/* Список серверов из SQLite */}
+        {servers.map((srv) => {
+          const isCurrent = activeServer && activeServer.id === srv.id;
+          return (
+            <div
+              key={srv.id}
+              onClick={() => setActiveServer(srv)}
+              title={srv.name}
+              style={{
+                width: 48,
+                height: 48,
+                borderRadius: isCurrent ? 16 : 24,
+                background: isCurrent ? "rgba(190, 242, 100, 0.15)" : "rgba(255, 255, 255, 0.04)",
+                border: isCurrent ? "2px solid #bef264" : "1px solid rgba(255, 255, 255, 0.1)",
+                color: isCurrent ? "#bef264" : "#ffffff",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontWeight: 900,
+                fontSize: 16,
+                cursor: "pointer",
+                position: "relative",
+                transition: "all 0.15s ease",
+              }}
+            >
+              {srv.icon || srv.name[0]}
+              {isCurrent && (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: -12,
+                    width: 4,
+                    height: 36,
+                    background: "#bef264",
+                    borderRadius: "0 4px 4px 0",
+                  }}
+                />
+              )}
+            </div>
+          );
+        })}
 
         {/* Добавить сервер (+) */}
         <div
-          title="Создать или подключить сервер"
+          onClick={() => setShowCreateServerModal(true)}
+          title="Создать новый сервер"
           style={{
             width: 48,
             height: 48,
@@ -421,7 +768,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* 2. БОКОВАЯ ПАНЕЛЬ КАНАЛОВ И СТАТУСА */}
+      {/* 2. САЙДБАР КАНАЛОВ И УЧАСТНИКОВ */}
       <div
         style={{
           width: 270,
@@ -442,209 +789,147 @@ export default function App() {
             justifyContent: "space-between",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.01em" }}>
-              Squad Gaming HQ
-            </span>
-          </div>
-          <span
+          <span style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.01em" }}>
+            {activeServer ? activeServer.name : "Выберите сервер"}
+          </span>
+          <button
+            onClick={() => setShowCreateChannelModal(true)}
+            title="Создать канал"
             style={{
-              fontSize: 10,
-              padding: "2px 7px",
-              borderRadius: 5,
-              background: "rgba(190, 242, 100, 0.15)",
-              border: "1px solid rgba(190, 242, 100, 0.3)",
+              background: "rgba(255, 255, 255, 0.06)",
+              border: "none",
+              borderRadius: 6,
               color: "#bef264",
-              fontWeight: 800,
+              width: 26,
+              height: 26,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
             }}
           >
-            PION SFU
-          </span>
+            <Plus size={16} />
+          </button>
         </div>
 
         {/* Список каналов */}
-        <div
-          style={{
-            flex: 1,
-            padding: "16px 10px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 18,
-            overflowY: "auto",
-          }}
-        >
-          {/* Категория: Текстовые каналы */}
+        <div style={{ flex: 1, padding: "16px 10px", display: "flex", flexDirection: "column", gap: 16, overflowY: "auto" }}>
+          {/* Текстовые каналы */}
           <div>
-            <div
-              style={{
-                fontSize: 11,
-                fontWeight: 700,
-                color: "rgba(255, 255, 255, 0.4)",
-                textTransform: "uppercase",
-                letterSpacing: "0.08em",
-                padding: "0 8px 6px 8px",
-              }}
-            >
+            <div style={{ fontSize: 11, fontWeight: 700, color: "rgba(255, 255, 255, 0.4)", textTransform: "uppercase", padding: "0 8px 6px" }}>
               Текстовые каналы
             </div>
-            {["general-chat", "clips-and-screenshots", "patch-notes"].map((ch) => {
-              const isCurrent = activeTab === "text" && activeTextChannel === ch;
-              return (
-                <div
-                  key={ch}
-                  onClick={() => {
-                    setActiveTab("text");
-                    setActiveTextChannel(ch);
-                  }}
-                  style={{
-                    padding: "8px 10px",
-                    borderRadius: 8,
-                    background: isCurrent ? "rgba(255, 255, 255, 0.08)" : "transparent",
-                    color: isCurrent ? "#ffffff" : "rgba(255, 255, 255, 0.6)",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 13.5,
-                    fontWeight: 600,
-                    transition: "all 0.15s ease",
-                  }}
-                >
-                  <Hash size={16} color={isCurrent ? "#bef264" : "rgba(255,255,255,0.4)"} />
-                  <span>{ch}</span>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Категория: Голосовые комнаты */}
-          <div>
-            <div
-              style={{
-                fontSize: 11,
-                fontWeight: 700,
-                color: "rgba(255, 255, 255, 0.4)",
-                textTransform: "uppercase",
-                letterSpacing: "0.08em",
-                padding: "0 8px 6px 8px",
-              }}
-            >
-              Голосовые комнаты (UDP/RTP)
-            </div>
-            {["Рейд войс [Pion SFU]", "Чилл & Музыка 128k", "Duo Arena"].map((ch) => {
-              const isCurrent = activeTab === "voice" && activeVoiceChannel === ch;
-              return (
-                <div key={ch}>
+            {channels
+              .filter((c) => c.type === "text")
+              .map((ch) => {
+                const isCurrent = activeChannel && activeChannel.id === ch.id;
+                return (
                   <div
-                    onClick={() => {
-                      setActiveTab("voice");
-                      setActiveVoiceChannel(ch);
-                      if (!isInVoice) setIsInVoice(true);
-                    }}
+                    key={ch.id}
+                    onClick={() => setActiveChannel(ch)}
                     style={{
                       padding: "8px 10px",
                       borderRadius: 8,
-                      background: isCurrent ? "rgba(190, 242, 100, 0.12)" : "transparent",
-                      border: isCurrent ? "1px solid rgba(190, 242, 100, 0.25)" : "1px solid transparent",
-                      color: isCurrent ? "#bef264" : "rgba(255, 255, 255, 0.7)",
+                      background: isCurrent ? "rgba(255, 255, 255, 0.08)" : "transparent",
+                      color: isCurrent ? "#ffffff" : "rgba(255, 255, 255, 0.6)",
                       cursor: "pointer",
                       display: "flex",
                       alignItems: "center",
-                      justifyContent: "space-between",
+                      gap: 8,
                       fontSize: 13.5,
                       fontWeight: 600,
-                      transition: "all 0.15s ease",
                     }}
                   >
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <VolumeIcon size={16} color={isCurrent ? "#bef264" : "rgba(255,255,255,0.4)"} />
-                      <span>{ch}</span>
+                    <Hash size={16} color={isCurrent ? "#bef264" : "rgba(255,255,255,0.4)"} />
+                    <span>{ch.name}</span>
+                  </div>
+                );
+              })}
+          </div>
+
+          {/* Голосовые комнаты */}
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "rgba(255, 255, 255, 0.4)", textTransform: "uppercase", padding: "0 8px 6px" }}>
+              Голосовые комнаты (UDP/RTP)
+            </div>
+            {channels
+              .filter((c) => c.type === "voice")
+              .map((ch) => {
+                const isCurrent = activeVoiceChannel && activeVoiceChannel.id === ch.id && isInVoice;
+                return (
+                  <div key={ch.id}>
+                    <div
+                      onClick={() => joinVoiceChannel(ch)}
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        background: isCurrent ? "rgba(190, 242, 100, 0.12)" : "transparent",
+                        border: isCurrent ? "1px solid rgba(190, 242, 100, 0.3)" : "1px solid transparent",
+                        color: isCurrent ? "#bef264" : "rgba(255, 255, 255, 0.7)",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        fontSize: 13.5,
+                        fontWeight: 600,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <VolumeIcon size={16} color={isCurrent ? "#bef264" : "rgba(255,255,255,0.4)"} />
+                        <span>{ch.name}</span>
+                      </div>
+                      {isCurrent && (
+                        <span
+                          style={{
+                            width: 8,
+                            height: 8,
+                            borderRadius: "50%",
+                            background: "#bef264",
+                            boxShadow: "0 0 8px #bef264",
+                          }}
+                        />
+                      )}
                     </div>
-                    {isCurrent && isInVoice && (
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: "50%",
-                          background: "#bef264",
-                          boxShadow: "0 0 8px #bef264",
-                        }}
-                      />
+
+                    {/* Если пользователь в этой комнате, показываем список реальных участников */}
+                    {isCurrent && (
+                      <div style={{ paddingLeft: 26, display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+                        {/* Локальный пользователь */}
+                        <div style={{ fontSize: 12, color: "#bef264", display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#bef264" }} />
+                          <span>{currentUser.display_name} (Вы)</span>
+                          {isMuted && <MicOff size={11} color="#ef4444" />}
+                        </div>
+                        {/* Удаленные участники из WebSockets */}
+                        {voicePeers.map((p) => (
+                          <div key={p.clientId} style={{ fontSize: 12, color: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.6)", display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ width: 6, height: 6, borderRadius: "50%", background: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.2)" }} />
+                            <span>{p.display_name}</span>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
-
-                  {/* Если эта комната активна, показываем мини-список говорящих в сайдбаре */}
-                  {isCurrent && isInVoice && (
-                    <div style={{ paddingLeft: 28, display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
-                      {peers.map((p) => (
-                        <div
-                          key={p.id}
-                          style={{
-                            fontSize: 12,
-                            color: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.5)",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                          }}
-                        >
-                          <div
-                            style={{
-                              width: 6,
-                              height: 6,
-                              borderRadius: "50%",
-                              background: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.2)",
-                            }}
-                          />
-                          <span>{p.name}</span>
-                          {p.isMuted && <MicOff size={11} color="#ef4444" />}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+                );
+              })}
           </div>
         </div>
 
-        {/* Панель активного WebRTC подключения */}
+        {/* Статус WebRTC соединения внизу (если в войсе) */}
         {isInVoice && (
-          <div
-            style={{
-              padding: "12px 14px",
-              background: "rgba(0, 0, 0, 0.45)",
-              borderTop: "1px solid rgba(255, 255, 255, 0.06)",
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ padding: "12px 14px", background: "rgba(0, 0, 0, 0.45)", borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#10b981" }}>
                 <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
-                <span>ГОЛОС ПОДКЛЮЧЕН (SFU)</span>
+                <span>SFU ПОДКЛЮЧЕН</span>
               </div>
-              <span style={{ fontFamily: "monospace", fontSize: 12, color: "#bef264", fontWeight: 800 }}>
-                {ping} ms
-              </span>
+              <span style={{ fontFamily: "monospace", fontSize: 12, color: "#bef264", fontWeight: 800 }}>{ping} ms</span>
             </div>
-
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
-              <span>Opus 128k • 48 kHz</span>
+              <span>{activeVoiceChannel?.name}</span>
               <button
-                onClick={() => setIsInVoice(false)}
-                title="Отключиться"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#ef4444",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 4,
-                  fontSize: 11,
-                  fontWeight: 700,
-                }}
+                onClick={leaveVoiceChannel}
+                style={{ background: "transparent", border: "none", color: "#ef4444", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 700 }}
               >
                 <PhoneOff size={13} />
                 <span>Выйти</span>
@@ -653,7 +938,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Профиль пользователя внизу */}
+        {/* Профиль пользователя */}
         <div
           style={{
             height: 56,
@@ -671,44 +956,30 @@ export default function App() {
                 width: 34,
                 height: 34,
                 borderRadius: "50%",
-                background: "#bef264",
+                background: currentUser.avatar_color,
                 color: "#090a0f",
                 fontWeight: 900,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 fontSize: 14,
-                position: "relative",
               }}
             >
-              А
-              <span
-                style={{
-                  position: "absolute",
-                  bottom: 0,
-                  right: 0,
-                  width: 10,
-                  height: 10,
-                  borderRadius: "50%",
-                  background: "#10b981",
-                  border: "2px solid #080a0f",
-                }}
-              />
+              {currentUser.display_name[0].toUpperCase()}
             </div>
             <div>
-              <div style={{ fontSize: 13, fontWeight: 700, lineHeight: 1.2 }}>Александр</div>
-              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>#0001 (Host)</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name}</div>
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>@{currentUser.username}</div>
             </div>
           </div>
 
-          {/* Кнопки управления микрофоном, звуком и настройками */}
           <div style={{ display: "flex", gap: 4 }}>
             <button
               onClick={() => setIsMuted(!isMuted)}
               title={isMuted ? "Включить микрофон" : "Заглушить микрофон"}
               style={{
-                width: 32,
-                height: 32,
+                width: 30,
+                height: 30,
                 borderRadius: 6,
                 background: isMuted ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.05)",
                 border: "none",
@@ -719,53 +990,33 @@ export default function App() {
                 cursor: "pointer",
               }}
             >
-              {isMuted ? <MicOff size={16} /> : <Mic size={16} />}
+              {isMuted ? <MicOff size={15} /> : <Mic size={15} />}
             </button>
-
             <button
-              onClick={() => setIsDeafened(!isDeafened)}
-              title={isDeafened ? "Включить звук" : "Заглушить наушники"}
+              onClick={handleLogout}
+              title="Выйти из аккаунта"
               style={{
-                width: 32,
-                height: 32,
-                borderRadius: 6,
-                background: isDeafened ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                border: "none",
-                color: isDeafened ? "#ef4444" : "#ffffff",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: "pointer",
-              }}
-            >
-              {isDeafened ? <VolumeX size={16} /> : <Headphones size={16} />}
-            </button>
-
-            <button
-              onClick={() => setShowSettingsModal(true)}
-              title="Настройки"
-              style={{
-                width: 32,
-                height: 32,
+                width: 30,
+                height: 30,
                 borderRadius: 6,
                 background: "rgba(255, 255, 255, 0.05)",
                 border: "none",
-                color: "rgba(255, 255, 255, 0.7)",
+                color: "rgba(255, 255, 255, 0.5)",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 cursor: "pointer",
               }}
             >
-              <Settings size={16} />
+              <LogOut size={15} />
             </button>
           </div>
         </div>
       </div>
 
-      {/* 3. ГЛАВНАЯ РАБОЧАЯ ОБЛАСТЬ */}
+      {/* 3. ГЛАВНАЯ ОБЛАСТЬ: ЧАТ ИЛИ ГОЛОС */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#090a0f" }}>
-        {/* Верхняя строка управления */}
+        {/* Шапка канала */}
         <div
           style={{
             height: 54,
@@ -776,28 +1027,17 @@ export default function App() {
             justifyContent: "space-between",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            {activeTab === "voice" ? <VolumeIcon size={20} color="#bef264" /> : <Hash size={20} color="#bef264" />}
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {isInVoice ? <VolumeIcon size={20} color="#bef264" /> : <Hash size={20} color="#bef264" />}
             <span style={{ fontSize: 16, fontWeight: 800 }}>
-              {activeTab === "voice" ? activeVoiceChannel : activeTextChannel}
-            </span>
-            <span
-              style={{
-                fontSize: 12,
-                color: "rgba(255, 255, 255, 0.4)",
-                fontFamily: "monospace",
-                marginLeft: 8,
-              }}
-            >
-              {activeTab === "voice" ? "Opus 128 kbps • 48 kHz Stereo • Pion SFU" : "Текстовый канал HQ"}
+              {isInVoice && activeVoiceChannel ? activeVoiceChannel.name : activeChannel ? activeChannel.name : "Канал"}
             </span>
           </div>
 
+          {/* Панель инструментов: Шумодав, Стрим экрана, Саммари */}
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            {/* Тумблер RNNoise шумодава */}
             <button
               onClick={() => setRnnoiseActive(!rnnoiseActive)}
-              title="RNNoise нейросетевое шумоподавление на WebAssembly"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -816,14 +1056,35 @@ export default function App() {
               <span>RNNoise: {rnnoiseActive ? "ВКЛ (-28dB)" : "ВЫКЛ"}</span>
             </button>
 
-            {/* Кнопка Саммари созвона (Whisper + LLM) */}
+            {isInVoice && (
+              <button
+                onClick={toggleScreenShare}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 14px",
+                  borderRadius: 8,
+                  background: isScreenSharing ? "rgba(239, 68, 68, 0.2)" : "rgba(190, 242, 100, 0.15)",
+                  border: isScreenSharing ? "1px solid #ef4444" : "1px solid #bef264",
+                  color: isScreenSharing ? "#ef4444" : "#bef264",
+                  fontSize: 12,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                }}
+              >
+                {isScreenSharing ? <MonitorOff size={14} /> : <Monitor size={14} />}
+                <span>{isScreenSharing ? "Стоп стрим" : "Стрим экрана 1080p60"}</span>
+              </button>
+            )}
+
             <button
               onClick={() => setShowSummaryModal(true)}
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: 6,
-                padding: "6px 14px",
+                padding: "6px 12px",
                 borderRadius: 8,
                 background: "rgba(168, 85, 247, 0.15)",
                 border: "1px solid #a855f7",
@@ -834,486 +1095,319 @@ export default function App() {
               }}
             >
               <Sparkles size={14} />
-              <span>Саммари войса</span>
-            </button>
-
-            {/* Кнопка шеринга экрана 1080p 60fps */}
-            <button
-              onClick={toggleScreenShare}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "6px 16px",
-                borderRadius: 8,
-                background: isScreenSharing ? "rgba(239, 68, 68, 0.2)" : "rgba(190, 242, 100, 0.15)",
-                border: isScreenSharing ? "1px solid #ef4444" : "1px solid #bef264",
-                color: isScreenSharing ? "#ef4444" : "#bef264",
-                fontSize: 12,
-                fontWeight: 800,
-                cursor: "pointer",
-              }}
-            >
-              {isScreenSharing ? <MonitorOff size={15} /> : <Monitor size={15} />}
-              <span>{isScreenSharing ? "Остановить стрим" : "Стрим экрана 1080p60"}</span>
-            </button>
-
-            {/* PWA установка */}
-            <button
-              onClick={() => setPwaInstalled(true)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "6px 12px",
-                borderRadius: 8,
-                background: pwaInstalled ? "rgba(16, 185, 129, 0.15)" : "rgba(255, 255, 255, 0.05)",
-                border: pwaInstalled ? "1px solid #10b981" : "1px solid rgba(255, 255, 255, 0.1)",
-                color: pwaInstalled ? "#10b981" : "#ffffff",
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-            >
-              {pwaInstalled ? <CheckCircle2 size={14} /> : <Download size={14} />}
-              <span>{pwaInstalled ? "PWA установлен" : "PWA"}</span>
+              <span>Саммари</span>
             </button>
           </div>
         </div>
 
-        {/* Контент: Голосовая сетка ИЛИ Текстовый чат */}
-        {activeTab === "voice" ? (
+        {/* Сетка голосовой комнаты (если в войсе) */}
+        {isInVoice && activeVoiceChannel && (
           <div
             style={{
-              flex: 1,
-              padding: 24,
-              display: "grid",
-              gridTemplateColumns: isScreenSharing ? "1.8fr 1fr" : "repeat(2, 1fr)",
-              gap: 20,
-              overflowY: "auto",
+              padding: 20,
+              background: "rgba(0, 0, 0, 0.3)",
+              borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 14,
             }}
           >
-            {/* Окно активного стрима экрана */}
+            {/* Видео стрима экрана */}
             {isScreenSharing && (
               <div
                 style={{
-                  background: "#040508",
-                  borderRadius: 18,
-                  border: "1px solid rgba(56, 189, 248, 0.35)",
+                  height: 380,
+                  background: "#000000",
+                  borderRadius: 14,
+                  border: "1px solid rgba(56, 189, 248, 0.4)",
                   overflow: "hidden",
                   display: "flex",
                   flexDirection: "column",
-                  position: "relative",
-                  boxShadow: "0 20px 60px rgba(0,0,0,0.8)",
+                }}
+              >
+                <div style={{ padding: "6px 14px", background: "rgba(0,0,0,0.6)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • 8.2 Mbps (Hardware WebRTC)</span>
+                  <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Стрим экрана: {currentUser.display_name}</span>
+                </div>
+                <video ref={screenVideoRef} autoPlay playsInline muted style={{ flex: 1, width: "100%", height: "100%", objectFit: "contain" }} />
+              </div>
+            )}
+
+            {/* Карточки участников войса */}
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+              {/* Локальный пользователь */}
+              <div
+                style={{
+                  width: 180,
+                  padding: 16,
+                  borderRadius: 14,
+                  background: "rgba(255, 255, 255, 0.03)",
+                  border: "1px solid rgba(190, 242, 100, 0.3)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 8,
                 }}
               >
                 <div
                   style={{
-                    height: 40,
-                    background: "rgba(0, 0, 0, 0.6)",
-                    backdropFilter: "blur(12px)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "0 16px",
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span
-                      style={{
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        background: "#ef4444",
-                        fontSize: 10,
-                        fontWeight: 900,
-                      }}
-                    >
-                      LIVE 60 FPS
-                    </span>
-                    <span style={{ fontSize: 13, fontWeight: 700 }}>Стрим экрана: Александр</span>
-                  </div>
-                  <span
-                    style={{
-                      fontSize: 12,
-                      color: "#bef264",
-                      fontWeight: 800,
-                      fontFamily: "monospace",
-                    }}
-                  >
-                    1080p 60.0 FPS • 8.2 Mbps
-                  </span>
-                </div>
-
-                <div
-                  style={{
-                    flex: 1,
+                    width: 54,
+                    height: 54,
+                    borderRadius: "50%",
+                    background: currentUser.avatar_color,
+                    color: "#090a0f",
+                    fontWeight: 900,
+                    fontSize: 22,
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    background: "#000000",
-                    position: "relative",
                   }}
                 >
-                  <video
-                    ref={screenVideoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                  />
+                  {currentUser.display_name[0].toUpperCase()}
                 </div>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
+                <div style={{ fontSize: 11, color: "#bef264" }}>{isMuted ? "Микрофон выкл" : "В сети"}</div>
               </div>
-            )}
 
-            {/* Сетка участников войса */}
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: isScreenSharing ? "1fr" : "repeat(2, 1fr)",
-                gap: 16,
-              }}
-            >
-              {peers.map((peer) => (
+              {/* Удаленные участники комнаты */}
+              {voicePeers.map((peer) => (
                 <div
-                  key={peer.id}
+                  key={peer.clientId}
                   style={{
-                    background: "rgba(16, 20, 30, 0.5)",
-                    borderRadius: 20,
-                    border: peer.isSpeaking
-                      ? `2px solid ${peer.avatarColor}`
-                      : "1px solid rgba(255, 255, 255, 0.08)",
-                    boxShadow: peer.isSpeaking ? `0 0 30px ${peer.avatarColor}40` : "none",
+                    width: 180,
+                    padding: 16,
+                    borderRadius: 14,
+                    background: "rgba(255, 255, 255, 0.03)",
+                    border: peer.isSpeaking ? `2px solid ${peer.avatar_color}` : "1px solid rgba(255, 255, 255, 0.08)",
+                    boxShadow: peer.isSpeaking ? `0 0 20px ${peer.avatar_color}40` : "none",
                     display: "flex",
                     flexDirection: "column",
                     alignItems: "center",
                     justifyContent: "center",
-                    padding: "28px 20px",
-                    position: "relative",
-                    transition: "all 0.15s ease",
+                    gap: 8,
                   }}
                 >
-                  {/* Пинг в углу */}
                   <div
                     style={{
-                      position: "absolute",
-                      top: 14,
-                      right: 16,
-                      fontSize: 11,
-                      fontFamily: "monospace",
-                      color: "#bef264",
-                    }}
-                  >
-                    {peer.ping} ms
-                  </div>
-
-                  {/* Аватар с неоновым светящимся кольцом */}
-                  <div
-                    style={{
-                      width: 86,
-                      height: 86,
+                      width: 54,
+                      height: 54,
                       borderRadius: "50%",
-                      background: peer.avatarColor,
+                      background: peer.avatar_color,
                       color: "#090a0f",
+                      fontWeight: 900,
+                      fontSize: 22,
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
-                      fontSize: 32,
-                      fontWeight: 900,
-                      position: "relative",
-                      boxShadow: peer.isSpeaking ? `0 0 25px ${peer.avatarColor}` : "none",
                     }}
                   >
-                    {peer.avatarLetter}
-
-                    {peer.isMuted && (
-                      <div
-                        style={{
-                          position: "absolute",
-                          bottom: -2,
-                          right: -2,
-                          width: 26,
-                          height: 26,
-                          borderRadius: "50%",
-                          background: "#ef4444",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          color: "#ffffff",
-                          border: "2px solid #090a0f",
-                        }}
-                      >
-                        <MicOff size={14} />
-                      </div>
-                    )}
+                    {peer.display_name[0].toUpperCase()}
                   </div>
-
-                  {/* Имя и роль */}
-                  <div style={{ marginTop: 14, fontWeight: 800, fontSize: 16 }}>{peer.name}</div>
-                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>
-                    {peer.role}
-                  </div>
-
-                  {/* Статус речи и индикатор громкости */}
-                  <div
-                    style={{
-                      marginTop: 10,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontSize: 11,
-                        color: peer.isSpeaking ? "#bef264" : "rgba(255,255,255,0.3)",
-                        fontWeight: 700,
-                      }}
-                    >
-                      {peer.isMuted
-                        ? "Микрофон выключен"
-                        : peer.isSpeaking
-                        ? "Говорит (Opus 128k)"
-                        : "Молчит"}
-                    </span>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
+                  <div style={{ fontSize: 11, color: peer.isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)" }}>
+                    {peer.isSpeaking ? "Говорит" : "Слушает"}
                   </div>
                 </div>
               ))}
             </div>
           </div>
-        ) : (
-          /* Текстовый чат канала */
-          <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-            <div style={{ flex: 1, padding: "24px 32px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 18 }}>
-              {messages.map((msg) => (
-                <div key={msg.id} style={{ display: "flex", gap: 14 }}>
-                  <div
-                    style={{
-                      width: 40,
-                      height: 40,
-                      borderRadius: "50%",
-                      background: msg.senderColor,
-                      color: "#090a0f",
-                      fontWeight: 900,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 16,
-                      flexShrink: 0,
-                    }}
-                  >
-                    {msg.avatarLetter}
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                      <span style={{ fontWeight: 800, fontSize: 14, color: msg.senderColor }}>
-                        {msg.sender}
-                      </span>
-                      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
-                        {msg.time}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: 14, color: "rgba(255,255,255,0.9)", lineHeight: 1.5 }}>
-                      {msg.text}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
+        )}
 
-            {/* Поле ввода сообщения */}
-            <form
-              onSubmit={handleSendMessage}
-              style={{
-                padding: "16px 24px",
-                background: "#080a0f",
-                borderTop: "1px solid rgba(255, 255, 255, 0.06)",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  background: "rgba(255, 255, 255, 0.05)",
-                  borderRadius: 12,
-                  padding: "6px 14px",
-                  border: "1px solid rgba(255, 255, 255, 0.08)",
-                }}
-              >
-                <Paperclip size={18} color="rgba(255,255,255,0.4)" style={{ cursor: "pointer", marginRight: 10 }} />
-                <input
-                  type="text"
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  placeholder={`Отправить сообщение в #${activeTextChannel}...`}
+        {/* Текстовые сообщения реального канала */}
+        <div style={{ flex: 1, padding: "20px 24px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+          {messages.length === 0 ? (
+            <div style={{ margin: "auto", textAlign: "center", color: "rgba(255,255,255,0.3)" }}>
+              <MessageSquare size={36} style={{ marginBottom: 10, opacity: 0.5 }} />
+              <div>Здесь пока нет сообщений в #{activeChannel?.name}.</div>
+              <div style={{ fontSize: 12, marginTop: 4 }}>Напишите первое сообщение ниже!</div>
+            </div>
+          ) : (
+            messages.map((msg) => (
+              <div key={msg.id} style={{ display: "flex", gap: 12 }}>
+                <div
                   style={{
-                    flex: 1,
-                    background: "transparent",
-                    border: "none",
-                    color: "#ffffff",
-                    fontSize: 14,
-                    outline: "none",
-                  }}
-                />
-                <Smile size={18} color="rgba(255,255,255,0.4)" style={{ cursor: "pointer", marginRight: 12 }} />
-                <button
-                  type="submit"
-                  style={{
-                    background: "#bef264",
-                    border: "none",
-                    borderRadius: 8,
-                    padding: "6px 12px",
+                    width: 38,
+                    height: 38,
+                    borderRadius: "50%",
+                    background: msg.avatar_color || "#bef264",
                     color: "#090a0f",
-                    fontWeight: 800,
-                    cursor: "pointer",
+                    fontWeight: 900,
                     display: "flex",
                     alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: 15,
+                    flexShrink: 0,
                   }}
                 >
-                  <Send size={15} />
+                  {msg.display_name ? msg.display_name[0].toUpperCase() : "U"}
+                </div>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                    <span style={{ fontWeight: 800, fontSize: 13, color: msg.avatar_color || "#bef264" }}>
+                      {msg.display_name}
+                    </span>
+                    <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
+                      {new Date(msg.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 14, color: "rgba(255,255,255,0.9)", lineHeight: 1.4 }}>{msg.content}</div>
+                </div>
+              </div>
+            ))
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Поле ввода сообщений */}
+        <form onSubmit={handleSendMessage} style={{ padding: "14px 20px", background: "#080a0f", borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              background: "rgba(255, 255, 255, 0.05)",
+              borderRadius: 10,
+              padding: "6px 14px",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+            }}
+          >
+            <input
+              type="text"
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              placeholder={`Отправить сообщение в #${activeChannel ? activeChannel.name : "канал"}...`}
+              style={{
+                flex: 1,
+                background: "transparent",
+                border: "none",
+                color: "#ffffff",
+                fontSize: 14,
+                outline: "none",
+              }}
+            />
+            <button
+              type="submit"
+              style={{
+                background: "#bef264",
+                border: "none",
+                borderRadius: 6,
+                padding: "6px 12px",
+                color: "#090a0f",
+                fontWeight: 800,
+                cursor: "pointer",
+              }}
+            >
+              <Send size={14} />
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {/* МОДАЛКА: СОЗДАТЬ СЕРВЕР */}
+      {showCreateServerModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div style={{ width: 400, background: "#111420", borderRadius: 16, border: "1px solid rgba(255,255,255,0.15)", padding: 24 }}>
+            <h3 style={{ margin: "0 0 16px 0", fontSize: 18 }}>Создать новый сервер</h3>
+            <form onSubmit={handleCreateServer}>
+              <input
+                type="text"
+                required
+                value={newServerName}
+                onChange={(e) => setNewServerName(e.target.value)}
+                placeholder="Название сервера (например, Squad HQ)"
+                style={{ width: "100%", padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", marginBottom: 16, outline: "none" }}
+              />
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button type="button" onClick={() => setShowCreateServerModal(false)} style={{ padding: "8px 16px", borderRadius: 8, background: "transparent", border: "1px solid rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer" }}>
+                  Отмена
+                </button>
+                <button type="submit" style={{ padding: "8px 16px", borderRadius: 8, background: "#bef264", border: "none", color: "#000", fontWeight: 800, cursor: "pointer" }}>
+                  Создать
                 </button>
               </div>
             </form>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      {/* МОДАЛЬНОЕ ОКНО: WHISPER + LLM САММАРИ */}
-      {showSummaryModal && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0, 0, 0, 0.75)",
-            backdropFilter: "blur(10px)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 1000,
-          }}
-        >
-          <div
-            style={{
-              width: 540,
-              background: "#111420",
-              border: "1px solid #a855f7",
-              borderRadius: 20,
-              boxShadow: "0 30px 90px rgba(0, 0, 0, 0.9)",
-              padding: 28,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#c084fc", fontWeight: 800, fontSize: 17 }}>
-                <Sparkles size={20} />
-                <span>AI Саммари созвона (Whisper + LLM)</span>
+      {/* МОДАЛКА: СОЗДАТЬ КАНАЛ */}
+      {showCreateChannelModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div style={{ width: 400, background: "#111420", borderRadius: 16, border: "1px solid rgba(255,255,255,0.15)", padding: 24 }}>
+            <h3 style={{ margin: "0 0 16px 0", fontSize: 18 }}>Создать канал</h3>
+            <form onSubmit={handleCreateChannel}>
+              <input
+                type="text"
+                required
+                value={newChannelName}
+                onChange={(e) => setNewChannelName(e.target.value)}
+                placeholder="название-канала"
+                style={{ width: "100%", padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", marginBottom: 14, outline: "none" }}
+              />
+              <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+                <button
+                  type="button"
+                  onClick={() => setNewChannelType("text")}
+                  style={{
+                    flex: 1,
+                    padding: 10,
+                    borderRadius: 8,
+                    background: newChannelType === "text" ? "rgba(190, 242, 100, 0.2)" : "rgba(255,255,255,0.05)",
+                    border: newChannelType === "text" ? "1px solid #bef264" : "1px solid transparent",
+                    color: newChannelType === "text" ? "#bef264" : "#fff",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                  }}
+                >
+                  # Текстовый
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNewChannelType("voice")}
+                  style={{
+                    flex: 1,
+                    padding: 10,
+                    borderRadius: 8,
+                    background: newChannelType === "voice" ? "rgba(190, 242, 100, 0.2)" : "rgba(255,255,255,0.05)",
+                    border: newChannelType === "voice" ? "1px solid #bef264" : "1px solid transparent",
+                    color: newChannelType === "voice" ? "#bef264" : "#fff",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                  }}
+                >
+                  🔊 Голосовой
+                </button>
               </div>
-              <X size={20} onClick={() => setShowSummaryModal(false)} style={{ cursor: "pointer", color: "rgba(255,255,255,0.5)" }} />
-            </div>
-
-            <div style={{ fontSize: 14, color: "rgba(255,255,255,0.85)", lineHeight: 1.6, display: "flex", flexDirection: "column", gap: 10 }}>
-              <div>
-                <strong>🔹 Тема:</strong> Развёртывание собственного сервера SquadWave на замену Discord.
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button type="button" onClick={() => setShowCreateChannelModal(false)} style={{ padding: "8px 16px", borderRadius: 8, background: "transparent", border: "1px solid rgba(255,255,255,0.2)", color: "#fff", cursor: "pointer" }}>
+                  Отмена
+                </button>
+                <button type="submit" style={{ padding: "8px 16px", borderRadius: 8, background: "#bef264", border: "none", color: "#000", fontWeight: 800, cursor: "pointer" }}>
+                  Создать
+                </button>
               </div>
-              <div>
-                <strong>🔹 Задержка:</strong> Зафиксировано 18 миллисекунд RTT на VPS за $3 в месяц.
-              </div>
-              <div>
-                <strong>🔹 Звук:</strong> Битрейт 128 kbps Opus Stereo, нейросеть RNNoise успешно устранила фоновые щелчки механической клавиатуры.
-              </div>
-              <div>
-                <strong>🔹 Решение:</strong> Запустить репозиторий на GitHub и предоставить docker-compose файл для сообщества.
-              </div>
-            </div>
-
-            <button
-              onClick={() => setShowSummaryModal(false)}
-              style={{
-                marginTop: 24,
-                width: "100%",
-                padding: "12px",
-                borderRadius: 10,
-                background: "#a855f7",
-                border: "none",
-                color: "#ffffff",
-                fontWeight: 800,
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              Закрыть
-            </button>
+            </form>
           </div>
         </div>
       )}
 
-      {/* МОДАЛЬНОЕ ОКНО: НАСТРОЙКИ СЕТИ И ЗВУКА */}
-      {showSettingsModal && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0, 0, 0, 0.75)",
-            backdropFilter: "blur(10px)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 1000,
-          }}
-        >
-          <div
-            style={{
-              width: 500,
-              background: "#111420",
-              border: "1px solid rgba(255, 255, 255, 0.15)",
-              borderRadius: 20,
-              boxShadow: "0 30px 90px rgba(0, 0, 0, 0.9)",
-              padding: 28,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-              <div style={{ fontWeight: 800, fontSize: 17 }}>⚙️ Настройки звука и SFU</div>
-              <X size={20} onClick={() => setShowSettingsModal(false)} style={{ cursor: "pointer", color: "rgba(255,255,255,0.5)" }} />
+      {/* МОДАЛКА: AI САММАРИ */}
+      {showSummaryModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div style={{ width: 500, background: "#111420", borderRadius: 16, border: "1px solid #a855f7", padding: 24 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#c084fc", fontWeight: 800 }}>
+                <Sparkles size={18} />
+                <span>AI Саммари созвона</span>
+              </div>
+              <X size={18} onClick={() => setShowSummaryModal(false)} style={{ cursor: "pointer" }} />
             </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-              <div>
-                <label style={{ fontSize: 12, color: "rgba(255,255,255,0.6)", fontWeight: 700 }}>АУДИОКОДЕК</label>
-                <div style={{ marginTop: 6, padding: "10px 14px", background: "rgba(255,255,255,0.05)", borderRadius: 8, fontSize: 13, border: "1px solid rgba(255,255,255,0.1)" }}>
-                  Opus Interactive Audio (48 000 Hz, Stereo, 128 kbps)
-                </div>
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, color: "rgba(255,255,255,0.6)", fontWeight: 700 }}>СЕРВЕР МАРШРУТИЗАЦИИ</label>
-                <div style={{ marginTop: 6, padding: "10px 14px", background: "rgba(255,255,255,0.05)", borderRadius: 8, fontSize: 13, border: "1px solid rgba(255,255,255,0.1)" }}>
-                  Go Pion SFU + Coturn TURN Relay (Symmetric NAT Bypassed)
-                </div>
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, color: "rgba(255,255,255,0.6)", fontWeight: 700 }}>ЗАДЕРЖКА (RTT)</label>
-                <div style={{ marginTop: 6, padding: "10px 14px", background: "rgba(190,242,100,0.1)", borderRadius: 8, fontSize: 13, color: "#bef264", fontWeight: 800, border: "1px solid rgba(190,242,100,0.3)" }}>
-                  ⚡ 18 миллисекунд (VPS за $3)
-                </div>
-              </div>
+            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.85)", lineHeight: 1.6 }}>
+              • <strong>Текущая комната:</strong> {activeVoiceChannel ? activeVoiceChannel.name : "Вне войса"}<br />
+              • <strong>Статус сети:</strong> PTT RTT 18ms через WebSockets & WebRTC<br />
+              • <strong>Шумодав:</strong> RNNoise Recurrent Neural Network активен локально в браузере<br />
+              • <strong>База данных:</strong> SQLite хранит пользователей, каналы и историю сообщений
             </div>
-
-            <button
-              onClick={() => setShowSettingsModal(false)}
-              style={{
-                marginTop: 24,
-                width: "100%",
-                padding: "12px",
-                borderRadius: 10,
-                background: "#bef264",
-                border: "none",
-                color: "#090a0f",
-                fontWeight: 800,
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              Сохранить
-            </button>
           </div>
         </div>
       )}
