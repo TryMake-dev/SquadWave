@@ -105,6 +105,7 @@ export default function App() {
   // Голосовая связь и WebRTC
   const [isInVoice, setIsInVoice] = useState(false);
   const [activeVoiceChannel, setActiveVoiceChannel] = useState<ChannelItem | null>(null);
+  const [viewingVoiceRoom, setViewingVoiceRoom] = useState(false);
   const [voicePeers, setVoicePeers] = useState<VoicePeer[]>([]);
   const voicePeersRef = useRef<VoicePeer[]>([]);
   voicePeersRef.current = voicePeers;
@@ -1168,8 +1169,28 @@ export default function App() {
 
   // Вход / выход из голосового канала
   const joinVoiceChannel = async (channel: ChannelItem) => {
+    // 1. Если кликаем по каналу, в котором уже находимся — открываем экран голосовой комнаты
+    if (isInVoice && activeVoiceChannel && activeVoiceChannel.id === channel.id) {
+      setViewingVoiceRoom(true);
+      return;
+    }
+
+    // 2. Если переключаемся из другого голосового канала: полностью закрываем старые WebRTC сессии и сбрасываем пиров
+    if (isInVoice) {
+      for (const entry of peerConnectionsRef.current.values()) {
+        try { entry.pc.close(); } catch (e) {}
+      }
+      peerConnectionsRef.current.clear();
+      setPeerAudioStreams(new Map());
+      setPeerScreenStreams(new Map());
+      setActiveScreenSharers(new Set());
+      setPeerScreenFrames(new Map());
+      setVoicePeers([]);
+    }
+
     setActiveVoiceChannel(channel);
     setIsInVoice(true);
+    setViewingVoiceRoom(true);
 
     const stream = await startAudioCapture();
     const outgoingStream = processedStreamRef.current || stream;
@@ -1239,6 +1260,7 @@ export default function App() {
     setIsInVoice(false);
     setActiveVoiceChannel(null);
     setVoicePeers([]);
+    setViewingVoiceRoom(false);
   };
 
   // Отправка сообщения чата
@@ -1588,7 +1610,10 @@ export default function App() {
           return (
             <div
               key={srv.id}
-              onClick={() => setActiveServer(srv)}
+              onClick={() => {
+                setActiveServer(srv);
+                setViewingVoiceRoom(false);
+              }}
               title={srv.name}
               style={{
                 width: 48,
@@ -1700,7 +1725,10 @@ export default function App() {
                 return (
                   <div
                     key={ch.id}
-                    onClick={() => setActiveChannel(ch)}
+                    onClick={() => {
+                      setActiveChannel(ch);
+                      setViewingVoiceRoom(false);
+                    }}
                     style={{
                       padding: "8px 10px",
                       borderRadius: 8,
@@ -1849,7 +1877,13 @@ export default function App() {
               <span style={{ fontFamily: "monospace", fontSize: 12, color: ping < 45 ? "#bef264" : ping < 120 ? "#facc15" : "#ef4444", fontWeight: 800 }}>{ping} ms</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
-              <span>{activeVoiceChannel?.name}</span>
+              <span
+                onClick={() => setViewingVoiceRoom(true)}
+                title="Открыть экран голосовой комнаты"
+                style={{ cursor: "pointer", color: viewingVoiceRoom ? "#bef264" : "rgba(255,255,255,0.7)", fontWeight: 600 }}
+              >
+                {activeVoiceChannel?.name}
+              </span>
               <button
                 onClick={leaveVoiceChannel}
                 style={{ background: "transparent", border: "none", color: "#ef4444", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 700 }}
@@ -2009,13 +2043,46 @@ export default function App() {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            {isInVoice ? <VolumeIcon size={20} color="#bef264" /> : <Hash size={20} color="#bef264" />}
-            <span style={{ fontSize: 16, fontWeight: 800 }}>
-              {isInVoice && activeVoiceChannel ? activeVoiceChannel.name : activeChannel ? activeChannel.name : "Канал"}
-            </span>
+            {viewingVoiceRoom && isInVoice && activeVoiceChannel ? (
+              <>
+                <VolumeIcon size={20} color="#bef264" />
+                <span style={{ fontSize: 16, fontWeight: 800 }}>{activeVoiceChannel.name}</span>
+              </>
+            ) : (
+              <>
+                <Hash size={20} color="#bef264" />
+                <span style={{ fontSize: 16, fontWeight: 800 }}>
+                  {activeChannel ? activeChannel.name : "general-chat"}
+                </span>
+              </>
+            )}
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            {/* Кнопка быстрого перехода в голосовую комнату если мы в войсе, но читаем чат */}
+            {isInVoice && !viewingVoiceRoom && activeVoiceChannel && (
+              <button
+                onClick={() => setViewingVoiceRoom(true)}
+                title="Перейти к экрану голосовой комнаты"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  background: "rgba(190, 242, 100, 0.15)",
+                  border: "1px solid #bef264",
+                  color: "#bef264",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                <VolumeIcon size={14} />
+                <span>В комнату {activeVoiceChannel.name}</span>
+              </button>
+            )}
+
             {/* Индикатор реального WebRTC P2P соединения */}
             {isInVoice && (
               <div
@@ -2092,8 +2159,30 @@ export default function App() {
           </div>
         </div>
 
-        {/* Сетка голосовой комнаты */}
-        {isInVoice && activeVoiceChannel && (
+        {/* Реальное воспроизведение звука всех удаленных участников по WebRTC (активно всегда при подключении к войсу) */}
+        {isInVoice &&
+          Array.from(peerAudioStreams.entries()).map(([peerId, stream]) => (
+            <audio
+              key={"audio-stream-" + peerId}
+              ref={(el) => {
+                if (el) {
+                  if (el.srcObject !== stream) {
+                    el.srcObject = stream;
+                  }
+                  el.volume = 1.0;
+                  el.muted = isDeafened;
+                  el.play().catch((e) => {
+                    console.warn("Peer audio autoplay blocked, waiting for user gesture:", e);
+                  });
+                }
+              }}
+              autoPlay
+              playsInline
+            />
+          ))}
+
+        {/* Сетка голосовой комнаты (показывается только когда открыт экран войса) */}
+        {viewingVoiceRoom && isInVoice && activeVoiceChannel && (
           <div
             style={{
               padding: 20,
@@ -2104,27 +2193,6 @@ export default function App() {
               gap: 14,
             }}
           >
-            {/* Реальное воспроизведение звука всех удаленных участников по WebRTC */}
-            {Array.from(peerAudioStreams.entries()).map(([peerId, stream]) => (
-              <audio
-                key={"audio-stream-" + peerId}
-                ref={(el) => {
-                  if (el) {
-                    if (el.srcObject !== stream) {
-                      el.srcObject = stream;
-                    }
-                    el.volume = 1.0;
-                    el.muted = isDeafened;
-                    el.play().catch((e) => {
-                      console.warn("Peer audio autoplay blocked, waiting for user gesture:", e);
-                    });
-                  }
-                }}
-                autoPlay
-                playsInline
-              />
-            ))}
-
             {/* Список участников голосовой комнаты и их стримы экрана */}
             <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-start", width: "100%" }}>
               {/* Локальный пользователь (Вы) */}

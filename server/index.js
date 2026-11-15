@@ -58,38 +58,7 @@ db.exec(`
   );
 `);
 
-// Создание дефолтного сервера если БД пустая
-const serverCountRow = db.prepare("SELECT COUNT(*) as count FROM servers").get();
-if (serverCountRow.count === 0) {
-  console.log("[DB] Создание начального сервера Squad Gaming HQ...");
-  const defaultServerId = "server_default_hq";
-  db.prepare("INSERT INTO servers (id, name, icon, owner_id, created_at) VALUES (?, ?, ?, ?, ?)").run(
-    defaultServerId,
-    "Squad Gaming HQ",
-    "⚡",
-    "system",
-    Date.now()
-  );
 
-  const defaultChannels = [
-    { id: "ch_general", name: "general-chat", type: "text" },
-    { id: "ch_clips", name: "clips-and-screenshots", type: "text" },
-    { id: "ch_patch", name: "patch-notes", type: "text" },
-    { id: "ch_voice_raid", name: "Рейд войс [Pion SFU]", type: "voice" },
-    { id: "ch_voice_chill", name: "Чилл & Музыка 128k", type: "voice" },
-    { id: "ch_voice_duo", name: "Duo Arena", type: "voice" },
-  ];
-
-  for (const ch of defaultChannels) {
-    db.prepare("INSERT INTO channels (id, server_id, name, type, created_at) VALUES (?, ?, ?, ?, ?)").run(
-      ch.id,
-      defaultServerId,
-      ch.name,
-      ch.type,
-      Date.now()
-    );
-  }
-}
 
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
@@ -277,6 +246,25 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ server: { id: serverId, name, icon: icon || name[0], owner_id: userId } }));
     });
+    return;
+  }
+
+  // Удаление сервера
+  const serverDeleteMatch = url.pathname.match(/^\/api\/servers\/([^/]+)$/);
+  if (serverDeleteMatch && req.method === "DELETE") {
+    const serverId = serverDeleteMatch[1];
+    const userId = parseToken(req.headers.authorization);
+    if (!userId) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
+    db.prepare("DELETE FROM servers WHERE id = ?").run(serverId);
+    db.prepare("DELETE FROM channels WHERE server_id = ?").run(serverId);
+    db.prepare("DELETE FROM server_members WHERE server_id = ?").run(serverId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, serverId }));
     return;
   }
 
