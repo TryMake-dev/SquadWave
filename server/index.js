@@ -437,6 +437,37 @@ const clients = new Map();
 const voiceRooms = new Map();
 const roomScreenSharers = new Map(); // channelId -> { clientId, sharerName }
 
+function broadcastToAll(data) {
+  const jsonStr = JSON.stringify(data);
+  for (const client of clients.values()) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(jsonStr);
+    }
+  }
+}
+
+function getAllVoiceStates() {
+  const states = {};
+  for (const [channelId, clientSet] of voiceRooms.entries()) {
+    const list = [];
+    for (const cId of clientSet) {
+      const cl = clients.get(cId);
+      if (cl) {
+        list.push({
+          clientId: cId,
+          userId: cl.userId,
+          display_name: cl.user ? cl.user.display_name : "Гость",
+          avatar_color: cl.user ? cl.user.avatar_color : "#bef264",
+        });
+      }
+    }
+    if (list.length > 0) {
+      states[channelId] = list;
+    }
+  }
+  return states;
+}
+
 function broadcastToChannel(channelId, data) {
   const jsonStr = JSON.stringify(data);
   for (const client of clients.values()) {
@@ -477,6 +508,7 @@ wss.on("connection", (ws, req) => {
 
   console.log(`[WS] Клиент подключен: ${clientId} (${user ? user.display_name : "гость"})`);
   ws.send(JSON.stringify({ type: "init", clientId, user }));
+  ws.send(JSON.stringify({ type: "all_voice_states", states: getAllVoiceStates() }));
 
   ws.on("message", (raw) => {
     try {
@@ -486,6 +518,18 @@ wss.on("connection", (ws, req) => {
         case "voice_join": {
           const { channelId } = msg;
           if (!channelId) return;
+
+          // Предотвращаем дублирование одного и того же пользователя из разных вкладок
+          if (clientInfo.userId) {
+            for (const [otherClientId, otherClient] of clients.entries()) {
+              if (otherClientId !== clientId && otherClient.userId === clientInfo.userId && otherClient.currentVoiceChannel) {
+                console.log(`[WS] Отключение дублирующей сессии пользователя ${clientInfo.user ? clientInfo.user.username : ""} (${otherClientId})`);
+                otherClient.ws.send(JSON.stringify({ type: "voice_force_disconnect", reason: "duplicate_session" }));
+                leaveVoiceRoom(otherClientId, otherClient.currentVoiceChannel);
+                otherClient.currentVoiceChannel = null;
+              }
+            }
+          }
 
           if (clientInfo.currentVoiceChannel) {
             leaveVoiceRoom(clientId, clientInfo.currentVoiceChannel);
@@ -529,7 +573,7 @@ wss.on("connection", (ws, req) => {
             }));
           }
 
-          // Оповещаем остальных, что подключился новый пир
+          // Оповещаем остальных в комнате, что подключился новый пир
           broadcastToVoiceRoom(channelId, {
             type: "voice_peer_joined",
             peer: {
@@ -539,6 +583,21 @@ wss.on("connection", (ws, req) => {
               avatar_color: clientInfo.user ? clientInfo.user.avatar_color : "#38bdf8",
             }
           }, clientId);
+
+          // Оповещаем ВСЕХ на сервере об обновлении списка участников канала (для отображения в сайдбаре как в Discord!)
+          const allRoomPeers = [];
+          for (const pid of room) {
+            const pinfo = clients.get(pid);
+            if (pinfo) {
+              allRoomPeers.push({
+                clientId: pid,
+                userId: pinfo.userId,
+                display_name: pinfo.user ? pinfo.user.display_name : "Гость",
+                avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+              });
+            }
+          }
+          broadcastToAll({ type: "voice_channel_state", channelId, peers: allRoomPeers });
           break;
         }
 
@@ -625,6 +684,24 @@ function leaveVoiceRoom(clientId, channelId) {
     broadcastToVoiceRoom(channelId, { type: "screen_share_status", clientId, isSharing: false });
   }
   broadcastToVoiceRoom(channelId, { type: "voice_peer_left", clientId });
+
+  // Обновляем список участников комнаты для всех клиентов в сайдбаре
+  const allRoomPeers = [];
+  const currentRoom = voiceRooms.get(channelId);
+  if (currentRoom) {
+    for (const pid of currentRoom) {
+      const pinfo = clients.get(pid);
+      if (pinfo) {
+        allRoomPeers.push({
+          clientId: pid,
+          userId: pinfo.userId,
+          display_name: pinfo.user ? pinfo.user.display_name : "Гость",
+          avatar_color: pinfo.user ? pinfo.user.avatar_color : "#bef264",
+        });
+      }
+    }
+  }
+  broadcastToAll({ type: "voice_channel_state", channelId, peers: allRoomPeers });
 }
 
 server.listen(PORT, "0.0.0.0", () => {

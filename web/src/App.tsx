@@ -91,6 +91,8 @@ export default function App() {
   // Чат
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [messageInput, setMessageInput] = useState("");
+  const activeChannelRef = useRef<ChannelItem | null>(null);
+  activeChannelRef.current = activeChannel;
 
   // Голосовая связь и WebRTC
   const [isInVoice, setIsInVoice] = useState(false);
@@ -98,6 +100,9 @@ export default function App() {
   const [voicePeers, setVoicePeers] = useState<VoicePeer[]>([]);
   const voicePeersRef = useRef<VoicePeer[]>([]);
   voicePeersRef.current = voicePeers;
+
+  // Глобальное состояние всех голосовых каналов (кто в каком сидит, как в Discord)
+  const [voiceRoomStates, setVoiceRoomStates] = useState<Record<string, VoicePeer[]>>({});
 
   const [isMuted, setIsMuted] = useState(false);
   const isMutedRef = useRef(false);
@@ -276,19 +281,6 @@ export default function App() {
           next.set(targetClientId, stream);
           return next;
         });
-
-        // Резервный DOM Audio элемент
-        let audioEl = document.getElementById("audio-fallback-" + targetClientId) as HTMLAudioElement;
-        if (!audioEl) {
-          audioEl = document.createElement("audio");
-          audioEl.id = "audio-fallback-" + targetClientId;
-          audioEl.autoplay = true;
-          (audioEl as any).playsInline = true;
-          document.body.appendChild(audioEl);
-        }
-        audioEl.srcObject = stream;
-        audioEl.volume = 1.0;
-        audioEl.play().catch((err) => console.warn("[WebRTC] Autoplay audio fallback error:", err));
       }
 
       if (event.track.kind === "video") {
@@ -345,8 +337,27 @@ export default function App() {
             myClientIdRef.current = msg.clientId;
             break;
 
+          // Начальное состояние всех голосовых каналов сервера
+          case "all_voice_states":
+            setVoiceRoomStates(msg.states || {});
+            break;
+
+          // Обновление состояния конкретного голосового канала (для отображения в сайдбаре как в Discord)
+          case "voice_channel_state":
+            setVoiceRoomStates((prev) => ({
+              ...prev,
+              [msg.channelId]: msg.peers || [],
+            }));
+            break;
+
+          // Принудительное отключение дублирующей сессии
+          case "voice_force_disconnect":
+            console.warn("[WS] Отключение от войса: выполнен вход из другого окна/браузера");
+            leaveVoiceChannel();
+            break;
+
           case "chat_message":
-            if (activeChannel && msg.message.channel_id === activeChannel.id) {
+            if (activeChannelRef.current && msg.message.channel_id === activeChannelRef.current.id) {
               setMessages((prev) => {
                 if (prev.some((m) => m.id === msg.message.id)) return prev;
                 return [...prev, msg.message];
@@ -384,8 +395,6 @@ export default function App() {
               entry.pc.close();
               peerConnectionsRef.current.delete(msg.clientId);
             }
-            const audioEl = document.getElementById("audio-fallback-" + msg.clientId);
-            if (audioEl) audioEl.remove();
 
             setPeerAudioStreams((prev) => {
               const next = new Map(prev);
@@ -473,49 +482,96 @@ export default function App() {
     return () => {
       ws.close();
     };
-  }, [currentUser, authToken, activeChannel]);
+  }, [currentUser?.id, authToken]);
 
-  // Анализатор голоса для индикации речи
-  const initAudioAnalyser = (stream: MediaStream) => {
+  // Студийный аудиотракт: захват микрофона, шумоподавление и Web Audio DSP
+  const startAudioCapture = async () => {
     try {
-      if (audioContextRef.current) {
-        audioContextRef.current.close().catch(() => {});
-      }
+      const rawStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+        },
+        video: false,
+      });
 
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      // Создаем Web Audio контекст для студийной фильтрации
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
       audioContextRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 64;
-      source.connect(analyser);
 
+      const micSource = ctx.createMediaStreamSource(rawStream);
+
+      // Highpass фильтр 85 Гц — полностью вырезает низкочастотный гул микрофона, кондиционеров и вибрации стола
+      const highpass = ctx.createBiquadFilter();
+      highpass.type = "highpass";
+      highpass.frequency.value = 85;
+
+      // DynamicsCompressor — автоматически выравнивает громкость, убирает хрипы и выравнивает тихий/громкий голос
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 30;
+      compressor.ratio.value = 3;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+
+      // Destination стрим, треки которого отправляются по WebRTC
+      const destination = ctx.createMediaStreamDestination();
+      micSource.connect(highpass);
+      highpass.connect(compressor);
+      compressor.connect(destination);
+
+      // AnalyserNode для VAD (детекции речи)
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 128;
+      compressor.connect(analyser);
+
+      const processedStream = destination.stream;
+      localStreamRef.current = processedStream;
+      (processedStream as any)._raw = rawStream;
+
+      // Плавная индикация речи с гистерезисом 300мс (не дрожит UI и не прерывает голос)
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let speakingFrames = 0;
       let wasSpeaking = false;
 
-      const loop = () => {
-        if (!audioContextRef.current || ctx.state === "closed") return;
+      const vadInterval = setInterval(() => {
+        if (!audioContextRef.current || ctx.state === "closed") {
+          clearInterval(vadInterval);
+          return;
+        }
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
         const avg = sum / dataArray.length;
-        const speaking = avg > 20 && !isMutedRef.current;
 
-        if (speaking !== wasSpeaking && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wasSpeaking = speaking;
-          wsRef.current.send(
-            JSON.stringify({
-              type: "voice_speaking",
-              isSpeaking: speaking,
-              volume: Math.min(100, Math.round(avg * 2)),
-            })
-          );
+        if (avg > 18 && !isMutedRef.current) {
+          speakingFrames = 5; // держим статус 300мс
+        } else if (speakingFrames > 0) {
+          speakingFrames--;
         }
 
-        requestAnimationFrame(loop);
-      };
-      requestAnimationFrame(loop);
-    } catch (e) {
-      console.warn("Audio analyser init error:", e);
+        const isSpeaking = speakingFrames > 0;
+        if (isSpeaking !== wasSpeaking) {
+          wasSpeaking = isSpeaking;
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: "voice_speaking",
+                isSpeaking,
+                volume: Math.min(100, Math.round(avg * 2)),
+              })
+            );
+          }
+        }
+      }, 60);
+
+      return processedStream;
+    } catch (err) {
+      console.warn("[Media] Ошибка захвата микрофона:", err);
+      return null;
     }
   };
 
@@ -523,6 +579,9 @@ export default function App() {
   useEffect(() => {
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !isMuted));
+      if ((localStreamRef.current as any)._raw) {
+        ((localStreamRef.current as any)._raw as MediaStream).getAudioTracks().forEach((t) => (t.enabled = !isMuted));
+      }
     }
   }, [isMuted]);
 
@@ -546,9 +605,9 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          frameRate: { ideal: 60 },
+          width: { ideal: 1920, max: 1920 },
+          height: { ideal: 1080, max: 1080 },
+          frameRate: { ideal: 60, max: 60 },
         },
         audio: false,
       });
@@ -606,19 +665,8 @@ export default function App() {
     setActiveVoiceChannel(channel);
     setIsInVoice(true);
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: !rnnoiseActive,
-          autoGainControl: true,
-        },
-        video: false,
-      });
-      localStreamRef.current = stream;
-      initAudioAnalyser(stream);
-
-      // Прикрепляем аудио-трек ко всем уже существующим соединениям
+    const stream = await startAudioCapture();
+    if (stream) {
       stream.getAudioTracks().forEach((track) => {
         track.enabled = !isMutedRef.current;
         for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
@@ -626,8 +674,6 @@ export default function App() {
           startNegotiation(peerId, entry);
         }
       });
-    } catch (err) {
-      console.warn("[Media] Микрофон недоступен:", err);
     }
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -647,6 +693,9 @@ export default function App() {
     peerConnectionsRef.current.clear();
 
     if (localStreamRef.current) {
+      if ((localStreamRef.current as any)._raw) {
+        ((localStreamRef.current as any)._raw as MediaStream).getTracks().forEach((t) => t.stop());
+      }
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
     }
@@ -659,8 +708,6 @@ export default function App() {
     if (isScreenSharing) {
       stopScreenShare();
     }
-
-    document.querySelectorAll("[id^='audio-fallback-']").forEach((a) => a.remove());
 
     setPeerAudioStreams(new Map());
     setIsInVoice(false);
@@ -1194,21 +1241,56 @@ export default function App() {
                       )}
                     </div>
 
-                    {isCurrent && (
-                      <div style={{ paddingLeft: 26, display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
-                        <div style={{ fontSize: 12, color: "#bef264", display: "flex", alignItems: "center", gap: 6 }}>
-                          <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#bef264" }} />
-                          <span>{currentUser.display_name} (Вы)</span>
-                          {isMuted && <MicOff size={11} color="#ef4444" />}
+                    {/* Список участников голосовой комнаты (виден ВСЕМ пользователям как в Discord) */}
+                    {(() => {
+                      const list = isCurrent
+                        ? [{ clientId: "self", userId: currentUser.id, display_name: `${currentUser.display_name} (Вы)`, avatar_color: currentUser.avatar_color, isSpeaking: false }, ...voicePeers]
+                        : (voiceRoomStates[ch.id] || []);
+                      if (list.length === 0) return null;
+                      return (
+                        <div style={{ paddingLeft: 26, display: "flex", flexDirection: "column", gap: 5, marginTop: 4, marginBottom: 4 }}>
+                          {list.map((p) => {
+                            const isMe = p.clientId === "self" || (currentUser && p.userId === currentUser.id);
+                            return (
+                              <div
+                                key={p.clientId + p.userId}
+                                style={{
+                                  fontSize: 12,
+                                  color: isMe ? "#bef264" : p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.7)",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  fontWeight: 600,
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    width: 16,
+                                    height: 16,
+                                    borderRadius: "50%",
+                                    background: p.avatar_color || "#bef264",
+                                    color: "#090a0f",
+                                    fontSize: 9,
+                                    fontWeight: 900,
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    border: p.isSpeaking ? "2px solid #bef264" : "none",
+                                    boxShadow: p.isSpeaking ? "0 0 6px #bef264" : "none",
+                                  }}
+                                >
+                                  {p.display_name[0].toUpperCase()}
+                                </div>
+                                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {p.display_name}
+                                </span>
+                                {isMe && isMuted && <MicOff size={11} color="#ef4444" />}
+                              </div>
+                            );
+                          })}
                         </div>
-                        {voicePeers.map((p) => (
-                          <div key={p.clientId} style={{ fontSize: 12, color: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.6)", display: "flex", alignItems: "center", gap: 6 }}>
-                            <div style={{ width: 6, height: 6, borderRadius: "50%", background: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.2)" }} />
-                            <span>{p.display_name}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                      );
+                    })()}
                   </div>
                 );
               })}
