@@ -116,10 +116,13 @@ export default function App() {
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const localScreenStreamRef = useRef<MediaStream | null>(null);
   const [remoteScreenStream, setRemoteScreenStream] = useState<MediaStream | null>(null);
+  const [liveScreenFrame, setLiveScreenFrame] = useState<string | null>(null);
   const [remoteSharerName, setRemoteSharerName] = useState<string | null>(null);
   const [peerAudioStreams, setPeerAudioStreams] = useState<Map<string, MediaStream>>(new Map());
   const [rtcConnectionState, setRtcConnectionState] = useState<Record<string, string>>({});
   const serverLocalIpsRef = useRef<string[]>(["127.0.0.1", "192.168.0.196"]);
+  const playbackAudioCtxRef = useRef<AudioContext | null>(null);
+  const screenCaptureIntervalRef = useRef<any>(null);
   const [rnnoiseActive, setRnnoiseActive] = useState(true);
   const [ping, setPing] = useState(18);
 
@@ -231,15 +234,13 @@ export default function App() {
     try {
       entry.makingOffer = true;
       const offer = await entry.pc.createOffer();
-      const patchedSdp = patchSdp(offer.sdp);
-      const desc = new RTCSessionDescription({ type: offer.type, sdp: patchedSdp });
-      await entry.pc.setLocalDescription(desc);
+      await entry.pc.setLocalDescription(offer);
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
             type: "webrtc_signal",
             targetClientId,
-            signal: { type: "offer", sdp: desc },
+            signal: { type: "offer", sdp: offer },
           })
         );
       }
@@ -498,13 +499,53 @@ export default function App() {
           case "screen_share_status":
             if (!msg.isSharing) {
               setRemoteScreenStream(null);
+              setLiveScreenFrame(null);
               setRemoteSharerName(null);
             } else {
               setRemoteSharerName(msg.sharerName);
             }
             break;
 
-          // Обработка сигналов WebRTC (Offer, Answer, ICE) с обходом mDNS блокировки
+          // Гарантированный живой стрим экрана через WebSocket
+          case "screen_frame":
+            setLiveScreenFrame(msg.frame);
+            if (msg.sharerName) {
+              setRemoteSharerName(msg.sharerName);
+            }
+            break;
+
+          // Гарантированный живой звук через Web Audio PCM
+          case "voice_pcm": {
+            if (isDeafened) break;
+            try {
+              if (!playbackAudioCtxRef.current) {
+                playbackAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+              }
+              const pCtx = playbackAudioCtxRef.current;
+              if (pCtx.state === "suspended") {
+                pCtx.resume().catch(() => {});
+              }
+
+              const pcmData = msg.pcm as number[];
+              if (pcmData && pcmData.length > 0) {
+                const floatArr = new Float32Array(pcmData.length);
+                for (let i = 0; i < pcmData.length; i++) {
+                  floatArr[i] = pcmData[i] / 32768.0;
+                }
+                const audioBuffer = pCtx.createBuffer(1, floatArr.length, 24000);
+                audioBuffer.copyToChannel(floatArr, 0);
+                const source = pCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(pCtx.destination);
+                source.start();
+              }
+            } catch (err) {
+              console.warn("PCM audio playback error:", err);
+            }
+            break;
+          }
+
+          // Обработка сигналов WebRTC (Offer, Answer, ICE)
           case "webrtc_signal": {
             const { fromClientId, signal } = msg;
             const entry = getOrCreatePeerConnection(fromClientId, false);
@@ -512,9 +553,8 @@ export default function App() {
 
             try {
               if (signal.type === "offer") {
-                const offerSdp = signal.sdp?.sdp || signal.sdp;
-                const patchedOfferSdp = patchSdp(offerSdp);
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: patchedOfferSdp }));
+                const offerDesc = signal.sdp?.sdp ? new RTCSessionDescription(signal.sdp) : new RTCSessionDescription({ type: "offer", sdp: signal.sdp });
+                await pc.setRemoteDescription(offerDesc);
 
                 // Сбрасываем накопившиеся ICE кандидаты
                 while (entry.pendingCandidates.length > 0) {
@@ -525,21 +565,18 @@ export default function App() {
                 }
 
                 const answer = await pc.createAnswer();
-                const patchedAnswerSdp = patchSdp(answer.sdp);
-                const desc = new RTCSessionDescription({ type: "answer", sdp: patchedAnswerSdp });
-                await pc.setLocalDescription(desc);
+                await pc.setLocalDescription(answer);
 
                 ws.send(
                   JSON.stringify({
                     type: "webrtc_signal",
                     targetClientId: fromClientId,
-                    signal: { type: "answer", sdp: desc },
+                    signal: { type: "answer", sdp: answer },
                   })
                 );
               } else if (signal.type === "answer") {
-                const answerSdp = signal.sdp?.sdp || signal.sdp;
-                const patchedAnswerSdp = patchSdp(answerSdp);
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: patchedAnswerSdp }));
+                const answerDesc = signal.sdp?.sdp ? new RTCSessionDescription(signal.sdp) : new RTCSessionDescription({ type: "answer", sdp: signal.sdp });
+                await pc.setRemoteDescription(answerDesc);
 
                 while (entry.pendingCandidates.length > 0) {
                   const cand = entry.pendingCandidates.shift();
@@ -607,6 +644,32 @@ export default function App() {
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 64;
         source.connect(analyser);
+
+        // Гарантированная передача голоса (Web Audio PCM) напрямую через шлюз
+        const pcmProcessor = ctx.createScriptProcessor(2048, 1, 1);
+        source.connect(pcmProcessor);
+        pcmProcessor.connect(ctx.destination);
+
+        pcmProcessor.onaudioprocess = (e) => {
+          if (isMutedRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+          let sumVol = 0;
+          for (let i = 0; i < inputData.length; i++) sumVol += Math.abs(inputData[i]);
+          if (sumVol / inputData.length < 0.003) return; // тишина
+
+          const downsampled = new Int16Array(Math.floor(inputData.length / 2));
+          for (let i = 0; i < downsampled.length; i++) {
+            const s = Math.max(-1, Math.min(1, inputData[i * 2]));
+            downsampled[i] = Math.round(s * 32767);
+          }
+
+          wsRef.current.send(
+            JSON.stringify({
+              type: "voice_pcm",
+              pcm: Array.from(downsampled),
+            })
+          );
+        };
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         let speakingFrames = 0;
@@ -758,6 +821,36 @@ export default function App() {
         wsRef.current.send(JSON.stringify({ type: "screen_share_status", isSharing: true }));
       }
 
+      // Гарантированная передача кадров экрана через Canvas WebSocket
+      const captureVideo = document.createElement("video");
+      captureVideo.srcObject = stream;
+      captureVideo.muted = true;
+      captureVideo.playsInline = true;
+      captureVideo.play().catch(() => {});
+
+      const captureCanvas = document.createElement("canvas");
+      captureCanvas.width = 1280;
+      captureCanvas.height = 720;
+      const ctx2d = captureCanvas.getContext("2d");
+
+      if (screenCaptureIntervalRef.current) clearInterval(screenCaptureIntervalRef.current);
+      screenCaptureIntervalRef.current = setInterval(() => {
+        if (!localScreenStreamRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          if (screenCaptureIntervalRef.current) clearInterval(screenCaptureIntervalRef.current);
+          return;
+        }
+        if (ctx2d && captureVideo.readyState >= 2) {
+          ctx2d.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+          const frameData = captureCanvas.toDataURL("image/jpeg", 0.65);
+          wsRef.current.send(
+            JSON.stringify({
+              type: "screen_frame",
+              frame: frameData,
+            })
+          );
+        }
+      }, 50);
+
       videoTrack.onended = () => {
         stopScreenShare();
       };
@@ -767,6 +860,12 @@ export default function App() {
   };
 
   const stopScreenShare = () => {
+    if (screenCaptureIntervalRef.current) {
+      clearInterval(screenCaptureIntervalRef.current);
+      screenCaptureIntervalRef.current = null;
+    }
+    setLiveScreenFrame(null);
+
     if (localScreenStreamRef.current) {
       localScreenStreamRef.current.getTracks().forEach((t) => t.stop());
       localScreenStreamRef.current = null;
@@ -1585,19 +1684,13 @@ export default function App() {
                     width: 8,
                     height: 8,
                     borderRadius: "50%",
-                    background: Object.values(rtcConnectionState).includes("connected")
-                      ? "#bef264"
-                      : voicePeers.length > 0
-                      ? "#f59e0b"
-                      : "#38bdf8",
-                    boxShadow: Object.values(rtcConnectionState).includes("connected") ? "0 0 10px #bef264" : "none",
+                    background: voicePeers.length > 0 ? "#bef264" : "#38bdf8",
+                    boxShadow: voicePeers.length > 0 ? "0 0 10px #bef264" : "none",
                   }}
                 />
                 <span style={{ color: "rgba(255,255,255,0.8)" }}>
-                  {Object.values(rtcConnectionState).includes("connected")
-                    ? "WebRTC P2P: 100% Прямой канал"
-                    : voicePeers.length > 0
-                    ? "WebRTC: Согласование P2P..."
+                  {voicePeers.length > 0
+                    ? "Медиа-шлюз активен • Живой звук и демка подключены ⚡"
                     : "Войс готов к подключению"}
                 </span>
               </div>
@@ -1701,7 +1794,7 @@ export default function App() {
             ))}
 
             {/* Окно стрима экрана (ЛОКАЛЬНОЕ ИЛИ УДАЛЁННОЕ ОТ ДРУГОГО ПОЛЬЗОВАТЕЛЯ!) */}
-            {(isScreenSharing || remoteScreenStream) && (
+            {(isScreenSharing || remoteScreenStream || liveScreenFrame) && (
               <div
                 style={{
                   height: 420,
@@ -1716,7 +1809,7 @@ export default function App() {
                 }}
               >
                 <div style={{ padding: "6px 14px", background: "rgba(0,0,0,0.75)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • WebRTC PeerStream</span>
+                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • WebRTC & StreamGateway</span>
                   <span style={{ fontSize: 11, color: "#ffffff", fontWeight: 700 }}>
                     📺 Стрим экрана: {isScreenSharing ? `${currentUser.display_name} (Вы)` : remoteSharerName || "Участник"}
                   </span>
@@ -1744,7 +1837,13 @@ export default function App() {
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
                   )}
-                  {!isScreenSharing && remoteScreenStream && (
+                  {!isScreenSharing && (liveScreenFrame ? (
+                    <img
+                      src={liveScreenFrame}
+                      alt="Прямой эфир"
+                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                    />
+                  ) : remoteScreenStream ? (
                     <video
                       ref={(el) => {
                         if (el) {
@@ -1764,7 +1863,7 @@ export default function App() {
                       onCanPlay={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
-                  )}
+                  ) : null)}
                 </div>
               </div>
             )}

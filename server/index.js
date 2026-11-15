@@ -748,6 +748,32 @@ wss.on("connection", (ws, req) => {
           }
           break;
         }
+
+        // Живой аудио-поток по WebSocket (гарантированная доставка звука при блокировках UDP/VPN)
+        case "voice_pcm": {
+          if (clientInfo.currentVoiceChannel) {
+            broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
+              type: "voice_pcm",
+              clientId,
+              userId: clientInfo.userId,
+              pcm: msg.pcm,
+            }, clientId);
+          }
+          break;
+        }
+
+        // Живой стрим экрана по WebSocket (гарантированное видео без черных экранов)
+        case "screen_frame": {
+          if (clientInfo.currentVoiceChannel) {
+            broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
+              type: "screen_frame",
+              clientId,
+              sharerName: clientInfo.user ? clientInfo.user.display_name : "Участник",
+              frame: msg.frame,
+            }, clientId);
+          }
+          break;
+        }
       }
     } catch (e) {
       console.error("[WS] Ошибка:", e);
