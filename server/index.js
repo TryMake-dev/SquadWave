@@ -436,7 +436,7 @@ const wss = new WebSocketServer({ server });
 
 const clients = new Map();
 const voiceRooms = new Map();
-const roomScreenSharers = new Map(); // channelId -> { clientId, sharerName }
+const roomScreenSharers = new Map(); // channelId -> Map<clientId, { clientId, sharerName }>
 
 function getLocalIpAddresses() {
   const ips = ["127.0.0.1"];
@@ -583,15 +583,17 @@ wss.on("connection", (ws, req) => {
           // Отправляем текущему список присутствующих
           ws.send(JSON.stringify({ type: "voice_room_peers", channelId, peers: peerList }));
 
-          // Если в комнате уже идет стрим экрана, сообщаем новичку
-          if (roomScreenSharers.has(channelId)) {
-            const sharer = roomScreenSharers.get(channelId);
-            ws.send(JSON.stringify({
-              type: "screen_share_status",
-              clientId: sharer.clientId,
-              isSharing: true,
-              sharerName: sharer.sharerName
-            }));
+          // Если в комнате уже идут стримы экрана, сообщаем новичку о каждом активном стримере
+          const channelSharers = roomScreenSharers.get(channelId);
+          if (channelSharers && channelSharers.size > 0) {
+            for (const sharer of channelSharers.values()) {
+              ws.send(JSON.stringify({
+                type: "screen_share_status",
+                clientId: sharer.clientId,
+                isSharing: true,
+                sharerName: sharer.sharerName
+              }));
+            }
           }
 
           // Оповещаем остальных в комнате, что подключился новый пир
@@ -771,12 +773,14 @@ wss.on("connection", (ws, req) => {
           if (clientInfo.currentVoiceChannel) {
             const chId = clientInfo.currentVoiceChannel;
             const sharerName = clientInfo.user ? clientInfo.user.display_name : "Участник";
+            if (!roomScreenSharers.has(chId)) {
+              roomScreenSharers.set(chId, new Map());
+            }
+            const channelSharers = roomScreenSharers.get(chId);
             if (msg.isSharing) {
-              roomScreenSharers.set(chId, { clientId, sharerName });
+              channelSharers.set(clientId, { clientId, sharerName });
             } else {
-              if (roomScreenSharers.get(chId)?.clientId === clientId) {
-                roomScreenSharers.delete(chId);
-              }
+              channelSharers.delete(clientId);
             }
             broadcastToVoiceRoom(chId, {
               type: "screen_share_status",
@@ -840,12 +844,14 @@ function leaveVoiceRoom(clientId, channelId) {
   const room = voiceRooms.get(channelId);
   if (!room) return;
   room.delete(clientId);
+  const channelSharers = roomScreenSharers.get(channelId);
+  if (channelSharers && channelSharers.has(clientId)) {
+    channelSharers.delete(clientId);
+    broadcastToVoiceRoom(channelId, { type: "screen_share_status", clientId, isSharing: false });
+  }
   if (room.size === 0) {
     voiceRooms.delete(channelId);
     roomScreenSharers.delete(channelId);
-  } else if (roomScreenSharers.get(channelId)?.clientId === clientId) {
-    roomScreenSharers.delete(channelId);
-    broadcastToVoiceRoom(channelId, { type: "screen_share_status", clientId, isSharing: false });
   }
   broadcastToVoiceRoom(channelId, { type: "voice_peer_left", clientId });
 

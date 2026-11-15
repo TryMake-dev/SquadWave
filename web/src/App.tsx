@@ -28,7 +28,10 @@ import {
   LogOut,
   User,
   Key,
-  MessageSquare
+  MessageSquare,
+  Maximize2,
+  Minimize2,
+  Tv
 } from "lucide-react";
 
 const API_BASE = window.location.hostname === "localhost" ? "http://localhost:3001" : "";
@@ -73,6 +76,7 @@ interface VoicePeer {
   isSpeaking?: boolean;
   isMuted?: boolean;
   isDeafened?: boolean;
+  isSharingScreen?: boolean;
   volume?: number;
 }
 
@@ -121,10 +125,24 @@ export default function App() {
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const localScreenStreamRef = useRef<MediaStream | null>(null);
-  const [remoteScreenStream, setRemoteScreenStream] = useState<MediaStream | null>(null);
-  const [liveScreenFrame, setLiveScreenFrame] = useState<string | null>(null);
-  const [remoteSharerName, setRemoteSharerName] = useState<string | null>(null);
+  const [peerScreenStreams, setPeerScreenStreams] = useState<Map<string, MediaStream>>(new Map());
+  const [activeScreenSharers, setActiveScreenSharers] = useState<Set<string>>(new Set());
+  const [peerScreenFrames, setPeerScreenFrames] = useState<Map<string, string>>(new Map());
   const [peerAudioStreams, setPeerAudioStreams] = useState<Map<string, MediaStream>>(new Map());
+
+  const toggleFullscreen = (elementId: string) => {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      if (el.requestFullscreen) {
+        el.requestFullscreen().catch(() => {});
+      } else if ((el as any).webkitRequestFullscreen) {
+        (el as any).webkitRequestFullscreen();
+      }
+    }
+  };
   const [rtcConnectionState, setRtcConnectionState] = useState<Record<string, string>>({});
   const serverLocalIpsRef = useRef<string[]>(["127.0.0.1", "192.168.0.196"]);
   const playbackAudioCtxRef = useRef<AudioContext | null>(null);
@@ -383,13 +401,12 @@ export default function App() {
 
       if (event.track.kind === "video") {
         console.log(`[WebRTC] Принят стрим экрана от ${targetClientId}`);
-        setRemoteScreenStream(stream);
-        const p = voicePeersRef.current.find((peer) => peer.clientId === targetClientId);
-        setRemoteSharerName(p ? p.display_name : "Собеседник");
+        setPeerScreenStreams((prev) => new Map(prev).set(targetClientId, stream));
+        setActiveScreenSharers((prev) => new Set(prev).add(targetClientId));
 
         event.track.onunmute = () => {
           console.log(`[WebRTC] Видео-трек разблокирован (прием кадров 1080p 60fps) от ${targetClientId}`);
-          const v = document.querySelector("video") as HTMLVideoElement | null;
+          const v = document.getElementById(`video-stream-${targetClientId}`) as HTMLVideoElement | null;
           if (v && v.paused) {
             v.muted = true;
             v.play().catch(() => {});
@@ -397,8 +414,16 @@ export default function App() {
         };
 
         event.track.onended = () => {
-          setRemoteScreenStream(null);
-          setRemoteSharerName(null);
+          setPeerScreenStreams((prev) => {
+            const next = new Map(prev);
+            next.delete(targetClientId);
+            return next;
+          });
+          setActiveScreenSharers((prev) => {
+            const next = new Set(prev);
+            next.delete(targetClientId);
+            return next;
+          });
         };
       }
     };
@@ -584,22 +609,40 @@ export default function App() {
             );
             break;
 
-          // Уведомление о стриме экрана
+          // Уведомление о стриме экрана конкретного участника
           case "screen_share_status":
-            if (!msg.isSharing) {
-              setRemoteScreenStream(null);
-              setLiveScreenFrame(null);
-              setRemoteSharerName(null);
+            if (msg.isSharing) {
+              setActiveScreenSharers((prev) => new Set(prev).add(msg.clientId));
+              setVoicePeers((prev) =>
+                prev.map((p) => (p.clientId === msg.clientId ? { ...p, isSharingScreen: true } : p))
+              );
             } else {
-              setRemoteSharerName(msg.sharerName);
+              setActiveScreenSharers((prev) => {
+                const next = new Set(prev);
+                next.delete(msg.clientId);
+                return next;
+              });
+              setPeerScreenStreams((prev) => {
+                const next = new Map(prev);
+                next.delete(msg.clientId);
+                return next;
+              });
+              setPeerScreenFrames((prev) => {
+                const next = new Map(prev);
+                next.delete(msg.clientId);
+                return next;
+              });
+              setVoicePeers((prev) =>
+                prev.map((p) => (p.clientId === msg.clientId ? { ...p, isSharingScreen: false } : p))
+              );
             }
             break;
 
-          // Гарантированный живой стрим экрана через WebSocket
+          // Гарантированный живой стрим экрана через WebSocket для конкретного клиента
           case "screen_frame":
-            setLiveScreenFrame(msg.frame);
-            if (msg.sharerName) {
-              setRemoteSharerName(msg.sharerName);
+            if (msg.clientId && msg.frame) {
+              setPeerScreenFrames((prev) => new Map(prev).set(msg.clientId, msg.frame));
+              setActiveScreenSharers((prev) => new Set(prev).add(msg.clientId));
             }
             break;
 
@@ -990,8 +1033,8 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          width: { ideal: 1920, max: 1920 },
-          height: { ideal: 1080, max: 1080 },
+          width: { ideal: 1920, max: 2560 },
+          height: { ideal: 1080, max: 1440 },
           frameRate: { ideal: 60, max: 60 },
         },
         audio: false,
@@ -1002,14 +1045,28 @@ export default function App() {
       setIsScreenSharing(true);
 
       const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && "contentHint" in videoTrack) {
+        (videoTrack as any).contentHint = "detail";
+      }
 
-      // Добавляем видео-трек во все активные соединения и согласуем
+      // Добавляем видео-трек во все активные соединения и задаем максимальный битрейт 8 Mbps
       for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
         const videoSender = entry.pc.getSenders().find((s) => s.track && s.track.kind === "video");
         if (videoSender) {
           videoSender.replaceTrack(videoTrack).catch(console.warn);
         } else {
-          entry.pc.addTrack(videoTrack, stream);
+          const sender = entry.pc.addTrack(videoTrack, stream);
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+              params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate = 8_000_000;
+            params.encodings[0].maxFramerate = 60;
+            params.encodings[0].priority = "high";
+            params.encodings[0].networkPriority = "high";
+            sender.setParameters(params).catch(() => {});
+          } catch (e) {}
           startNegotiation(peerId, entry);
         }
       }
@@ -1036,8 +1093,8 @@ export default function App() {
       captureVideo.play().catch(() => {});
 
       const captureCanvas = document.createElement("canvas");
-      captureCanvas.width = 1280;
-      captureCanvas.height = 720;
+      captureCanvas.width = 1920;
+      captureCanvas.height = 1080;
       const ctx2d = captureCanvas.getContext("2d");
 
       if (screenCaptureIntervalRef.current) clearInterval(screenCaptureIntervalRef.current);
@@ -1048,7 +1105,7 @@ export default function App() {
         }
         if (ctx2d && captureVideo.readyState >= 2) {
           ctx2d.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
-          const frameData = captureCanvas.toDataURL("image/jpeg", 0.60);
+          const frameData = captureCanvas.toDataURL("image/jpeg", 0.85);
           wsRef.current.send(
             JSON.stringify({
               type: "screen_frame",
@@ -1077,7 +1134,6 @@ export default function App() {
       captureVideoRef.current.remove();
       captureVideoRef.current = null;
     }
-    setLiveScreenFrame(null);
 
     if (localScreenStreamRef.current) {
       localScreenStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -1169,11 +1225,12 @@ export default function App() {
     }
 
     setPeerAudioStreams(new Map());
+    setPeerScreenStreams(new Map());
+    setActiveScreenSharers(new Set());
+    setPeerScreenFrames(new Map());
     setIsInVoice(false);
     setActiveVoiceChannel(null);
     setVoicePeers([]);
-    setRemoteScreenStream(null);
-    setRemoteSharerName(null);
   };
 
   // Отправка сообщения чата
@@ -2060,275 +2117,462 @@ export default function App() {
               />
             ))}
 
-            {/* Окно стрима экрана (ЛОКАЛЬНОЕ ИЛИ УДАЛЁННОЕ ОТ ДРУГОГО ПОЛЬЗОВАТЕЛЯ!) */}
-            {(isScreenSharing || remoteScreenStream || liveScreenFrame) && (
+            {/* Список участников голосовой комнаты и их стримы экрана */}
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-start" }}>
+              {/* Локальный пользователь (Вы) */}
               <div
                 style={{
-                  height: 420,
-                  background: "#000000",
-                  borderRadius: 14,
-                  border: "2px solid #38bdf8",
-                  overflow: "hidden",
                   display: "flex",
-                  flexDirection: "column",
-                  position: "relative",
-                  boxShadow: "0 20px 60px rgba(56, 189, 248, 0.2)",
+                  alignItems: "stretch",
+                  gap: 12,
+                  background: isScreenSharing ? "rgba(190, 242, 100, 0.04)" : "transparent",
+                  padding: isScreenSharing ? "8px 12px" : "0",
+                  borderRadius: 16,
+                  border: isScreenSharing ? "1px solid rgba(190, 242, 100, 0.25)" : "none",
+                  transition: "all 0.2s ease",
                 }}
               >
-                <div style={{ padding: "6px 14px", background: "rgba(0,0,0,0.75)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • WebRTC & StreamGateway</span>
-                  <span style={{ fontSize: 11, color: "#ffffff", fontWeight: 700 }}>
-                    📺 Стрим экрана: {isScreenSharing ? `${currentUser.display_name} (Вы)` : remoteSharerName || "Участник"}
-                  </span>
-                </div>
-
-                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#05070a", position: "relative" }}>
-                  {isScreenSharing && localScreenStream && (
-                    <video
-                      ref={(el) => {
-                        if (el) {
-                          el.muted = true;
-                          el.defaultMuted = true;
-                          el.playsInline = true;
-                          if (el.srcObject !== localScreenStream) {
-                            el.srcObject = localScreenStream;
-                          }
-                          el.play().catch(console.warn);
-                        }
-                      }}
-                      autoPlay
-                      playsInline
-                      muted
-                      onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
-                      onCanPlay={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
-                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                    />
-                  )}
-                  {!isScreenSharing && (liveScreenFrame ? (
-                    <img
-                      src={liveScreenFrame}
-                      alt="Прямой эфир"
-                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                    />
-                  ) : remoteScreenStream ? (
-                    <video
-                      ref={(el) => {
-                        if (el) {
-                          el.muted = true;
-                          el.defaultMuted = true;
-                          el.playsInline = true;
-                          if (el.srcObject !== remoteScreenStream) {
-                            el.srcObject = remoteScreenStream;
-                          }
-                          el.play().catch(console.warn);
-                        }
-                      }}
-                      autoPlay
-                      playsInline
-                      muted
-                      onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
-                      onCanPlay={(e) => (e.currentTarget as HTMLVideoElement).play().catch(console.warn)}
-                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                    />
-                  ) : null)}
-                </div>
-              </div>
-            )}
-
-            {/* Карточки участников войса */}
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-              {/* Локальный пользователь */}
-              <div
-                style={{
-                  width: 180,
-                  padding: 16,
-                  borderRadius: 14,
-                  background: "rgba(255, 255, 255, 0.03)",
-                  border: isDeafened
-                    ? "1px solid rgba(239, 68, 68, 0.45)"
-                    : isMuted
-                    ? "1px solid rgba(255, 255, 255, 0.08)"
-                    : isSelfSpeaking
-                    ? "2px solid #bef264"
-                    : "1px solid rgba(190, 242, 100, 0.4)",
-                  boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 8,
-                  transition: "all 0.15s ease",
-                  position: "relative",
-                }}
-              >
-                <div style={{ position: "relative" }}>
-                  <div
-                    style={{
-                      width: 58,
-                      height: 58,
-                      borderRadius: "50%",
-                      background: currentUser.avatar_color,
-                      color: "#090a0f",
-                      fontWeight: 900,
-                      fontSize: 24,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      border: !isMuted && !isDeafened && isSelfSpeaking ? "2px solid #bef264" : "none",
-                      boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 20px #bef264" : "none",
-                    }}
-                  >
-                    {currentUser.display_name[0].toUpperCase()}
-                  </div>
-                  {(isDeafened || isMuted) && (
+                {/* Карточка пользователя */}
+                <div
+                  style={{
+                    width: 180,
+                    minHeight: 160,
+                    padding: 16,
+                    borderRadius: 14,
+                    background: "rgba(255, 255, 255, 0.03)",
+                    border: isDeafened
+                      ? "1px solid rgba(239, 68, 68, 0.45)"
+                      : isMuted
+                      ? "1px solid rgba(255, 255, 255, 0.08)"
+                      : isSelfSpeaking
+                      ? "2px solid #bef264"
+                      : "1px solid rgba(190, 242, 100, 0.4)",
+                    boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 25px rgba(190, 242, 100, 0.4)" : "none",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 8,
+                    transition: "all 0.15s ease",
+                    position: "relative",
+                    flexShrink: 0,
+                  }}
+                >
+                  <div style={{ position: "relative" }}>
                     <div
                       style={{
-                        position: "absolute",
-                        bottom: -2,
-                        right: -2,
-                        width: 22,
-                        height: 22,
+                        width: 58,
+                        height: 58,
                         borderRadius: "50%",
-                        background: "#ef4444",
+                        background: currentUser.avatar_color,
+                        color: "#090a0f",
+                        fontWeight: 900,
+                        fontSize: 24,
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        border: "2px solid #0d0f15",
-                        boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                        border: !isMuted && !isDeafened && isSelfSpeaking ? "2px solid #bef264" : "none",
+                        boxShadow: !isMuted && !isDeafened && isSelfSpeaking ? "0 0 20px #bef264" : "none",
                       }}
-                      title={isDeafened ? "Звук выключен (наушники)" : "Микрофон выключен"}
                     >
-                      {isDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                      {currentUser.display_name[0].toUpperCase()}
+                    </div>
+                    {(isDeafened || isMuted) && (
+                      <div
+                        style={{
+                          position: "absolute",
+                          bottom: -2,
+                          right: -2,
+                          width: 22,
+                          height: 22,
+                          borderRadius: "50%",
+                          background: "#ef4444",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          border: "2px solid #0d0f15",
+                          boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                        }}
+                        title={isDeafened ? "Звук выключен" : "Микрофон выключен"}
+                      >
+                        {isDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: isDeafened || isMuted ? 600 : 400,
+                      color: isDeafened ? "#ef4444" : isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                    }}
+                  >
+                    {isDeafened ? (
+                      <>
+                        <VolumeX size={12} color="#ef4444" />
+                        <span>Звук выключен</span>
+                      </>
+                    ) : isMuted ? (
+                      <>
+                        <MicOff size={11} color="#ef4444" />
+                        <span>Микрофон выкл</span>
+                      </>
+                    ) : isSelfSpeaking ? (
+                      <span>Говорит</span>
+                    ) : (
+                      <span>В сети</span>
+                    )}
+                  </div>
+                  {isScreenSharing && (
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#bef264", background: "rgba(190, 242, 100, 0.15)", padding: "2px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                      <Monitor size={10} />
+                      <span>В эфире</span>
                     </div>
                   )}
                 </div>
-                <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    fontWeight: isDeafened || isMuted ? 600 : 400,
-                    color: isDeafened ? "#ef4444" : isMuted ? "#ef4444" : isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.5)",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                  }}
-                >
-                  {isDeafened ? (
-                    <>
-                      <VolumeX size={12} color="#ef4444" />
-                      <span>Звук выключен 🔇</span>
-                    </>
-                  ) : isMuted ? (
-                    <>
-                      <MicOff size={11} color="#ef4444" />
-                      <span>Микрофон выкл</span>
-                    </>
-                  ) : isSelfSpeaking ? (
-                    <span>Говорит 🔊</span>
-                  ) : (
-                    <span>В сети</span>
-                  )}
-                </div>
+
+                {/* Стрим экрана локального пользователя (СПРАВА ОТ КАРТОЧКИ!) */}
+                {isScreenSharing && localScreenStream && (
+                  <div
+                    id="stream-container-self"
+                    style={{
+                      width: "clamp(340px, 42vw, 580px)",
+                      height: 220,
+                      borderRadius: 14,
+                      background: "#000000",
+                      border: "2px solid #bef264",
+                      overflow: "hidden",
+                      display: "flex",
+                      flexDirection: "column",
+                      position: "relative",
+                      boxShadow: "0 10px 30px rgba(190, 242, 100, 0.2)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: "6px 12px",
+                        background: "rgba(0, 0, 0, 0.75)",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        zIndex: 2,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 10, background: "#ef4444", color: "#fff", fontWeight: 800, padding: "2px 6px", borderRadius: 4 }}>
+                          LIVE 1080p60
+                        </span>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: "#ffffff" }}>
+                          Ваш стрим экрана
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button
+                          onClick={() => toggleFullscreen("stream-container-self")}
+                          title="Развернуть на весь экран"
+                          style={{
+                            background: "rgba(255, 255, 255, 0.1)",
+                            border: "none",
+                            borderRadius: 6,
+                            padding: "4px 8px",
+                            color: "#ffffff",
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 4,
+                            fontSize: 11,
+                            fontWeight: 700,
+                          }}
+                        >
+                          <Maximize2 size={13} />
+                          <span>Во весь экран</span>
+                        </button>
+                        <button
+                          onClick={stopScreenShare}
+                          title="Остановить стрим"
+                          style={{
+                            background: "rgba(239, 68, 68, 0.2)",
+                            border: "1px solid rgba(239, 68, 68, 0.4)",
+                            borderRadius: 6,
+                            padding: "4px 8px",
+                            color: "#ef4444",
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 4,
+                            fontSize: 11,
+                            fontWeight: 700,
+                          }}
+                        >
+                          <MonitorOff size={13} />
+                          <span>Стоп</span>
+                        </button>
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        flex: 1,
+                        background: "#05070a",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        cursor: "pointer",
+                      }}
+                      onDoubleClick={() => toggleFullscreen("stream-container-self")}
+                    >
+                      <video
+                        ref={(el) => {
+                          if (el) {
+                            el.muted = true;
+                            el.defaultMuted = true;
+                            el.playsInline = true;
+                            if (el.srcObject !== localScreenStream) {
+                              el.srcObject = localScreenStream;
+                            }
+                            el.play().catch(() => {});
+                          }
+                        }}
+                        autoPlay
+                        playsInline
+                        muted
+                        style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
 
-              {/* Удаленные участники (светятся при речи и воспроизводят звук!) */}
+              {/* Удаленные участники */}
               {voicePeers.map((peer) => {
                 const isPeerDeafened = !!peer.isDeafened;
                 const isPeerMuted = !!peer.isMuted;
                 const isSpeaking = peer.isSpeaking && !isPeerMuted && !isPeerDeafened;
+                const isPeerStreaming = activeScreenSharers.has(peer.clientId) || !!peer.isSharingScreen;
+                const peerStream = peerScreenStreams.get(peer.clientId);
+                const peerFrame = peerScreenFrames.get(peer.clientId);
+                const containerId = `stream-container-${peer.clientId}`;
+
                 return (
                   <div
                     key={peer.clientId}
                     style={{
-                      width: 180,
-                      padding: 16,
-                      borderRadius: 14,
-                      background: "rgba(255, 255, 255, 0.03)",
-                      border: isPeerDeafened
-                        ? "1px solid rgba(239, 68, 68, 0.4)"
-                        : isPeerMuted
-                        ? "1px solid rgba(255, 255, 255, 0.08)"
-                        : isSpeaking
-                        ? `2px solid ${peer.avatar_color}`
-                        : "1px solid rgba(255, 255, 255, 0.08)",
-                      boxShadow: isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
                       display: "flex",
-                      flexDirection: "column",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: 8,
-                      transition: "all 0.15s ease",
-                      position: "relative",
+                      alignItems: "stretch",
+                      gap: 12,
+                      background: isPeerStreaming ? "rgba(56, 189, 248, 0.04)" : "transparent",
+                      padding: isPeerStreaming ? "8px 12px" : "0",
+                      borderRadius: 16,
+                      border: isPeerStreaming ? "1px solid rgba(56, 189, 248, 0.25)" : "none",
+                      transition: "all 0.2s ease",
                     }}
                   >
-                    <div style={{ position: "relative" }}>
-                      <div
-                        style={{
-                          width: 58,
-                          height: 58,
-                          borderRadius: "50%",
-                          background: peer.avatar_color,
-                          color: "#090a0f",
-                          fontWeight: 900,
-                          fontSize: 24,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
-                          boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
-                        }}
-                      >
-                        {peer.display_name[0].toUpperCase()}
-                      </div>
-                      {(isPeerDeafened || isPeerMuted) && (
+                    {/* Карточка участника */}
+                    <div
+                      style={{
+                        width: 180,
+                        minHeight: 160,
+                        padding: 16,
+                        borderRadius: 14,
+                        background: "rgba(255, 255, 255, 0.03)",
+                        border: isPeerDeafened
+                          ? "1px solid rgba(239, 68, 68, 0.4)"
+                          : isPeerMuted
+                          ? "1px solid rgba(255, 255, 255, 0.08)"
+                          : isSpeaking
+                          ? `2px solid ${peer.avatar_color}`
+                          : "1px solid rgba(255, 255, 255, 0.08)",
+                        boxShadow: isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: 8,
+                        transition: "all 0.15s ease",
+                        position: "relative",
+                        flexShrink: 0,
+                      }}
+                    >
+                      <div style={{ position: "relative" }}>
                         <div
                           style={{
-                            position: "absolute",
-                            bottom: -2,
-                            right: -2,
-                            width: 22,
-                            height: 22,
+                            width: 58,
+                            height: 58,
                             borderRadius: "50%",
-                            background: "#ef4444",
+                            background: peer.avatar_color,
+                            color: "#090a0f",
+                            fontWeight: 900,
+                            fontSize: 24,
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
-                            border: "2px solid #0d0f15",
-                            boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                            border: isSpeaking ? `2px solid ${peer.avatar_color}` : "none",
+                            boxShadow: isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
                           }}
-                          title={isPeerDeafened ? "Звук выключен (наушники)" : "Микрофон выключен"}
                         >
-                          {isPeerDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                          {peer.display_name[0].toUpperCase()}
+                        </div>
+                        {(isPeerDeafened || isPeerMuted) && (
+                          <div
+                            style={{
+                              position: "absolute",
+                              bottom: -2,
+                              right: -2,
+                              width: 22,
+                              height: 22,
+                              borderRadius: "50%",
+                              background: "#ef4444",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              border: "2px solid #0d0f15",
+                              boxShadow: "0 2px 6px rgba(0,0,0,0.6)",
+                            }}
+                            title={isPeerDeafened ? "Звук выключен" : "Микрофон выключен"}
+                          >
+                            {isPeerDeafened ? <VolumeX size={12} color="#ffffff" /> : <MicOff size={11} color="#ffffff" />}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: isPeerDeafened || isPeerMuted ? 600 : 400,
+                          color: isPeerDeafened ? "#ef4444" : isPeerMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 4,
+                        }}
+                      >
+                        {isPeerDeafened ? (
+                          <>
+                            <VolumeX size={12} color="#ef4444" />
+                            <span>Звук выключен</span>
+                          </>
+                        ) : isPeerMuted ? (
+                          <>
+                            <MicOff size={11} color="#ef4444" />
+                            <span>Микрофон выкл</span>
+                          </>
+                        ) : isSpeaking ? (
+                          <span>Говорит</span>
+                        ) : (
+                          <span>Слушает</span>
+                        )}
+                      </div>
+                      {isPeerStreaming && (
+                        <div style={{ fontSize: 10, fontWeight: 800, color: "#38bdf8", background: "rgba(56, 189, 248, 0.15)", padding: "2px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                          <Monitor size={10} />
+                          <span>В эфире</span>
                         </div>
                       )}
                     </div>
-                    <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
-                    <div
-                      style={{
-                        fontSize: 11,
-                        fontWeight: isPeerDeafened || isPeerMuted ? 600 : 400,
-                        color: isPeerDeafened ? "#ef4444" : isPeerMuted ? "#ef4444" : isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 4,
-                      }}
-                    >
-                      {isPeerDeafened ? (
-                        <>
-                          <VolumeX size={12} color="#ef4444" />
-                          <span>Звук выключен 🔇</span>
-                        </>
-                      ) : isPeerMuted ? (
-                        <>
-                          <MicOff size={11} color="#ef4444" />
-                          <span>Микрофон выкл</span>
-                        </>
-                      ) : isSpeaking ? (
-                        <span>Говорит 🔊</span>
-                      ) : (
-                        <span>Слушает</span>
-                      )}
-                    </div>
+
+                    {/* Стрим экрана удаленного участника (СПРАВА ОТ КАРТОЧКИ!) */}
+                    {isPeerStreaming && (
+                      <div
+                        id={containerId}
+                        style={{
+                          width: "clamp(340px, 42vw, 580px)",
+                          height: 220,
+                          borderRadius: 14,
+                          background: "#000000",
+                          border: "2px solid #38bdf8",
+                          overflow: "hidden",
+                          display: "flex",
+                          flexDirection: "column",
+                          position: "relative",
+                          boxShadow: "0 10px 30px rgba(56, 189, 248, 0.2)",
+                        }}
+                      >
+                        <div
+                          style={{
+                            padding: "6px 12px",
+                            background: "rgba(0, 0, 0, 0.75)",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            zIndex: 2,
+                          }}
+                        >
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 10, background: "#ef4444", color: "#fff", fontWeight: 800, padding: "2px 6px", borderRadius: 4 }}>
+                              LIVE 1080p60
+                            </span>
+                            <span style={{ fontSize: 12, fontWeight: 700, color: "#ffffff" }}>
+                              Стрим: {peer.display_name}
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => toggleFullscreen(containerId)}
+                            title="Развернуть на весь экран"
+                            style={{
+                              background: "rgba(255, 255, 255, 0.1)",
+                              border: "none",
+                              borderRadius: 6,
+                              padding: "4px 8px",
+                              color: "#ffffff",
+                              cursor: "pointer",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 4,
+                              fontSize: 11,
+                              fontWeight: 700,
+                            }}
+                          >
+                            <Maximize2 size={13} />
+                            <span>Во весь экран</span>
+                          </button>
+                        </div>
+                        <div
+                          style={{
+                            flex: 1,
+                            background: "#05070a",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            cursor: "pointer",
+                            position: "relative",
+                          }}
+                          onDoubleClick={() => toggleFullscreen(containerId)}
+                        >
+                          {peerStream ? (
+                            <video
+                              id={`video-stream-${peer.clientId}`}
+                              ref={(el) => {
+                                if (el) {
+                                  el.muted = true;
+                                  el.defaultMuted = true;
+                                  el.playsInline = true;
+                                  if (el.srcObject !== peerStream) {
+                                    el.srcObject = peerStream;
+                                  }
+                                  el.play().catch(() => {});
+                                }
+                              }}
+                              autoPlay
+                              playsInline
+                              muted
+                              style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                            />
+                          ) : peerFrame ? (
+                            <img
+                              src={peerFrame}
+                              alt={`Стрим ${peer.display_name}`}
+                              style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                            />
+                          ) : (
+                            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                              <Monitor size={16} />
+                              <span>Подключение к 1080p60 WebRTC потоку...</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
