@@ -15,7 +15,6 @@ const WEB_DIST = path.join(__dirname, "../web/dist");
 console.log(`[DB] Подключение к SQLite базе: ${DB_PATH}`);
 const db = new DatabaseSync(DB_PATH);
 
-// Создание таблиц
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -45,7 +44,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     server_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    type TEXT NOT NULL, -- 'text' | 'voice'
+    type TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
 
@@ -91,7 +90,6 @@ if (serverCountRow.count === 0) {
   }
 }
 
-// Хеширование паролей
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
@@ -116,7 +114,6 @@ function parseToken(authHeader) {
 // 2. HTTP Сервер и REST API
 // ==========================================
 const server = http.createServer((req, res) => {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -129,7 +126,6 @@ const server = http.createServer((req, res) => {
 
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  // Чтение тела запроса
   const readJsonBody = (cb) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -143,7 +139,7 @@ const server = http.createServer((req, res) => {
     });
   };
 
-  // --- API: Регистрация ---
+  // Регистрация
   if (req.method === "POST" && url.pathname === "/api/auth/register") {
     readJsonBody((body) => {
       const { username, password, display_name } = body;
@@ -176,7 +172,6 @@ const server = http.createServer((req, res) => {
         Date.now()
       );
 
-      // Автоматически добавляем во все серверы
       const allServers = db.prepare("SELECT id FROM servers").all();
       for (const s of allServers) {
         db.prepare("INSERT OR IGNORE INTO server_members (server_id, user_id, role) VALUES (?, ?, 'member')").run(s.id, userId);
@@ -192,7 +187,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // --- API: Вход ---
+  // Вход
   if (req.method === "POST" && url.pathname === "/api/auth/login") {
     readJsonBody((body) => {
       const { username, password } = body;
@@ -219,7 +214,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // --- API: Проверка текущего пользователя (/api/auth/me) ---
+  // Проверка сессии
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const userId = parseToken(req.headers.authorization);
     if (!userId) {
@@ -238,7 +233,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // --- API: Список серверов ---
+  // Серверы
   if (req.method === "GET" && url.pathname === "/api/servers") {
     const servers = db.prepare("SELECT * FROM servers ORDER BY created_at ASC").all();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -246,7 +241,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // --- API: Создать сервер ---
   if (req.method === "POST" && url.pathname === "/api/servers") {
     const userId = parseToken(req.headers.authorization);
     if (!userId) {
@@ -274,7 +268,6 @@ const server = http.createServer((req, res) => {
 
       db.prepare("INSERT INTO server_members (server_id, user_id, role) VALUES (?, ?, 'owner')").run(serverId, userId);
 
-      // Дефолтные каналы
       const generalTextId = "ch_" + crypto.randomBytes(6).toString("hex");
       const generalVoiceId = "ch_" + crypto.randomBytes(6).toString("hex");
       db.prepare("INSERT INTO channels (id, server_id, name, type, created_at) VALUES (?, ?, 'general-chat', 'text', ?)").run(generalTextId, serverId, Date.now());
@@ -286,7 +279,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // --- API: Каналы сервера (/api/servers/:id/channels) ---
+  // Каналы
   const channelsMatch = url.pathname.match(/^\/api\/servers\/([^/]+)\/channels$/);
   if (channelsMatch) {
     const serverId = channelsMatch[1];
@@ -329,7 +322,7 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // --- API: Сообщения канала (/api/channels/:id/messages) ---
+  // Сообщения
   const messagesMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/messages$/);
   if (messagesMatch) {
     const channelId = messagesMatch[1];
@@ -390,7 +383,6 @@ const server = http.createServer((req, res) => {
           }
         };
 
-        // Трансляция сообщения через WebSocket
         broadcastToChannel(channelId, msgPayload);
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -400,7 +392,7 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // --- Раздача статики (React PWA) ---
+  // Статика React PWA
   if (fs.existsSync(WEB_DIST)) {
     let filePath = path.join(WEB_DIST, url.pathname === "/" ? "index.html" : url.pathname);
     if (!fs.existsSync(filePath)) {
@@ -441,14 +433,13 @@ const server = http.createServer((req, res) => {
 // ==========================================
 const wss = new WebSocketServer({ server });
 
-// Хранилище подключений: clientId -> { ws, userId, user, currentVoiceChannel }
 const clients = new Map();
-// Voice rooms: channelId -> Set(clientId)
 const voiceRooms = new Map();
+const roomScreenSharers = new Map(); // channelId -> { clientId, sharerName }
 
 function broadcastToChannel(channelId, data) {
   const jsonStr = JSON.stringify(data);
-  for (const [clientId, client] of clients.entries()) {
+  for (const client of clients.values()) {
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(jsonStr);
     }
@@ -485,8 +476,6 @@ wss.on("connection", (ws, req) => {
   clients.set(clientId, clientInfo);
 
   console.log(`[WS] Клиент подключен: ${clientId} (${user ? user.display_name : "гость"})`);
-
-  // Отправляем клиенту его собственный ID
   ws.send(JSON.stringify({ type: "init", clientId, user }));
 
   ws.on("message", (raw) => {
@@ -494,12 +483,10 @@ wss.on("connection", (ws, req) => {
       const msg = JSON.parse(raw);
 
       switch (msg.type) {
-        // --- 1. Вход в голосовую комнату ---
         case "voice_join": {
           const { channelId } = msg;
           if (!channelId) return;
 
-          // Покидаем старую комнату если были
           if (clientInfo.currentVoiceChannel) {
             leaveVoiceRoom(clientId, clientInfo.currentVoiceChannel);
           }
@@ -511,7 +498,6 @@ wss.on("connection", (ws, req) => {
           room.add(clientId);
           clientInfo.currentVoiceChannel = channelId;
 
-          // Список существующих участников в комнате
           const peerList = [];
           for (const peerId of room) {
             if (peerId !== clientId) {
@@ -527,10 +513,23 @@ wss.on("connection", (ws, req) => {
             }
           }
 
-          // Отправляем текущему клиенту список тех, кто уже в войсе
+          console.log(`[WS:Voice] ${clientInfo.user ? clientInfo.user.display_name : clientId} зашел в комнату ${channelId}. Участников: ${room.size}`);
+
+          // Отправляем текущему список присутствующих
           ws.send(JSON.stringify({ type: "voice_room_peers", channelId, peers: peerList }));
 
-          // Оповещаем остальных, что вошел новый участник
+          // Если в комнате уже идет стрим экрана, сообщаем новичку
+          if (roomScreenSharers.has(channelId)) {
+            const sharer = roomScreenSharers.get(channelId);
+            ws.send(JSON.stringify({
+              type: "screen_share_status",
+              clientId: sharer.clientId,
+              isSharing: true,
+              sharerName: sharer.sharerName
+            }));
+          }
+
+          // Оповещаем остальных, что подключился новый пир
           broadcastToVoiceRoom(channelId, {
             type: "voice_peer_joined",
             peer: {
@@ -540,11 +539,9 @@ wss.on("connection", (ws, req) => {
               avatar_color: clientInfo.user ? clientInfo.user.avatar_color : "#38bdf8",
             }
           }, clientId);
-
           break;
         }
 
-        // --- 2. Выход из голосовой комнаты ---
         case "voice_leave": {
           if (clientInfo.currentVoiceChannel) {
             leaveVoiceRoom(clientId, clientInfo.currentVoiceChannel);
@@ -553,7 +550,7 @@ wss.on("connection", (ws, req) => {
           break;
         }
 
-        // --- 3. WebRTC Сигналинг: Offer, Answer, ICE Candidate ---
+        // WebRTC Signaling: Offer, Answer, ICE
         case "webrtc_signal": {
           const { targetClientId, signal } = msg;
           const target = clients.get(targetClientId);
@@ -567,7 +564,7 @@ wss.on("connection", (ws, req) => {
           break;
         }
 
-        // --- 4. Индикация речи (Speaking Status & Volume) ---
+        // Индикация речи
         case "voice_speaking": {
           if (clientInfo.currentVoiceChannel) {
             broadcastToVoiceRoom(clientInfo.currentVoiceChannel, {
@@ -579,9 +576,31 @@ wss.on("connection", (ws, req) => {
           }
           break;
         }
+
+        // Стрим экрана (уведомление о старте/стопе)
+        case "screen_share_status": {
+          if (clientInfo.currentVoiceChannel) {
+            const chId = clientInfo.currentVoiceChannel;
+            const sharerName = clientInfo.user ? clientInfo.user.display_name : "Участник";
+            if (msg.isSharing) {
+              roomScreenSharers.set(chId, { clientId, sharerName });
+            } else {
+              if (roomScreenSharers.get(chId)?.clientId === clientId) {
+                roomScreenSharers.delete(chId);
+              }
+            }
+            broadcastToVoiceRoom(chId, {
+              type: "screen_share_status",
+              clientId,
+              isSharing: msg.isSharing,
+              sharerName
+            }, clientId);
+          }
+          break;
+        }
       }
     } catch (e) {
-      console.error("[WS] Ошибка обработки сообщения:", e);
+      console.error("[WS] Ошибка:", e);
     }
   });
 
@@ -600,11 +619,14 @@ function leaveVoiceRoom(clientId, channelId) {
   room.delete(clientId);
   if (room.size === 0) {
     voiceRooms.delete(channelId);
+    roomScreenSharers.delete(channelId);
+  } else if (roomScreenSharers.get(channelId)?.clientId === clientId) {
+    roomScreenSharers.delete(channelId);
+    broadcastToVoiceRoom(channelId, { type: "screen_share_status", clientId, isSharing: false });
   }
   broadcastToVoiceRoom(channelId, { type: "voice_peer_left", clientId });
 }
 
-// Запуск сервера
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 [SquadWave Server] Запущен на http://0.0.0.0:${PORT}`);
   console.log(`💾 [SQLite] База данных готова к работе`);

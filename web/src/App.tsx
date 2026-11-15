@@ -88,7 +88,7 @@ export default function App() {
   const [channels, setChannels] = useState<ChannelItem[]>([]);
   const [activeChannel, setActiveChannel] = useState<ChannelItem | null>(null);
 
-  // Сообщения чата
+  // Чат
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [messageInput, setMessageInput] = useState("");
 
@@ -96,9 +96,20 @@ export default function App() {
   const [isInVoice, setIsInVoice] = useState(false);
   const [activeVoiceChannel, setActiveVoiceChannel] = useState<ChannelItem | null>(null);
   const [voicePeers, setVoicePeers] = useState<VoicePeer[]>([]);
+  const voicePeersRef = useRef<VoicePeer[]>([]);
+  voicePeersRef.current = voicePeers;
+
   const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef(false);
+  isMutedRef.current = isMuted;
+
   const [isDeafened, setIsDeafened] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
+  const localScreenStreamRef = useRef<MediaStream | null>(null);
+  const [remoteScreenStream, setRemoteScreenStream] = useState<MediaStream | null>(null);
+  const [remoteSharerName, setRemoteSharerName] = useState<string | null>(null);
+  const [peerAudioStreams, setPeerAudioStreams] = useState<Map<string, MediaStream>>(new Map());
   const [rnnoiseActive, setRnnoiseActive] = useState(true);
   const [ping, setPing] = useState(18);
 
@@ -109,18 +120,22 @@ export default function App() {
   const [newChannelName, setNewChannelName] = useState("");
   const [newChannelType, setNewChannelType] = useState<"text" | "voice">("text");
   const [showSummaryModal, setShowSummaryModal] = useState(false);
-  const [showSettingsModal, setShowSettingsModal] = useState(false);
 
-  // Рефы
+  // Рефы WebRTC и Медиа
   const wsRef = useRef<WebSocket | null>(null);
   const myClientIdRef = useRef<string | null>(null);
-  const screenVideoRef = useRef<HTMLVideoElement>(null);
-  const screenStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+
+  interface PeerEntry {
+    pc: RTCPeerConnection;
+    pendingCandidates: any[];
+    makingOffer: boolean;
+  }
+  const peerConnectionsRef = useRef<Map<string, PeerEntry>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // 1. Проверка текущей сессии
+  // 1. Проверка сессии
   useEffect(() => {
     if (!authToken) return;
     fetch(`${API_BASE}/api/auth/me`, {
@@ -138,7 +153,7 @@ export default function App() {
       });
   }, [authToken]);
 
-  // 2. Загрузка списка серверов
+  // 2. Загрузка серверов
   useEffect(() => {
     if (!currentUser) return;
     fetch(`${API_BASE}/api/servers`)
@@ -152,7 +167,7 @@ export default function App() {
       .catch(console.error);
   }, [currentUser]);
 
-  // 3. Загрузка каналов при смене сервера
+  // 3. Загрузка каналов
   useEffect(() => {
     if (!activeServer) return;
     fetch(`${API_BASE}/api/servers/${activeServer.id}/channels`)
@@ -166,7 +181,7 @@ export default function App() {
       .catch(console.error);
   }, [activeServer]);
 
-  // 4. Загрузка сообщений при смене текстового канала
+  // 4. Загрузка сообщений
   useEffect(() => {
     if (!activeChannel || activeChannel.type !== "text") return;
     fetch(`${API_BASE}/api/channels/${activeChannel.id}/messages`)
@@ -175,12 +190,142 @@ export default function App() {
       .catch(console.error);
   }, [activeChannel]);
 
-  // Прокрутка чата вниз
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // 5. Подключение к WebSocket
+  // Глобальный автостарт аудио при первом клике пользователя (обход ограничений Autoplay)
+  useEffect(() => {
+    const resumeAudio = () => {
+      document.querySelectorAll("audio").forEach((el) => {
+        if (el.paused) el.play().catch(() => {});
+      });
+      if (audioContextRef.current && audioContextRef.current.state === "suspended") {
+        audioContextRef.current.resume().catch(() => {});
+      }
+    };
+    window.addEventListener("click", resumeAudio);
+    return () => window.removeEventListener("click", resumeAudio);
+  }, []);
+
+  // ==========================================================
+  // 5. ПОЛНОЦЕННОЕ WEBRTC СОЕДИНЕНИЕ И СИГНАЛИНГ
+  // ==========================================================
+  const startNegotiation = async (targetClientId: string, entry: { pc: RTCPeerConnection; makingOffer: boolean }) => {
+    try {
+      entry.makingOffer = true;
+      const offer = await entry.pc.createOffer();
+      await entry.pc.setLocalDescription(offer);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "webrtc_signal",
+            targetClientId,
+            signal: { type: "offer", sdp: offer },
+          })
+        );
+      }
+    } catch (err) {
+      console.error(`[WebRTC] Ошибка согласования оффера для ${targetClientId}:`, err);
+    } finally {
+      entry.makingOffer = false;
+    }
+  };
+
+  const getOrCreatePeerConnection = (targetClientId: string, isInitiator: boolean) => {
+    let entry = peerConnectionsRef.current.get(targetClientId);
+    if (entry) return entry;
+
+    console.log(`[WebRTC] Создание PeerConnection для: ${targetClientId} (Initiator: ${isInitiator})`);
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
+      ],
+    });
+
+    const newEntry = { pc, pendingCandidates: [] as any[], makingOffer: false };
+    peerConnectionsRef.current.set(targetClientId, newEntry);
+
+    // Прикрепляем локальный аудио-трек микрофона если есть
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = !isMutedRef.current;
+        pc.addTrack(track, localStreamRef.current!);
+      });
+    }
+
+    // Прикрепляем трек экрана если уже стримим
+    if (localScreenStreamRef.current) {
+      localScreenStreamRef.current.getVideoTracks().forEach((track) => {
+        pc.addTrack(track, localScreenStreamRef.current!);
+      });
+    }
+
+    // Прием удаленных медиа-потоков
+    pc.ontrack = (event) => {
+      console.log(`[WebRTC] Принят медиа-трек: ${event.track.kind} от ${targetClientId}`);
+      const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+
+      if (event.track.kind === "audio") {
+        setPeerAudioStreams((prev) => {
+          const next = new Map(prev);
+          next.set(targetClientId, stream);
+          return next;
+        });
+
+        // Резервный DOM Audio элемент
+        let audioEl = document.getElementById("audio-fallback-" + targetClientId) as HTMLAudioElement;
+        if (!audioEl) {
+          audioEl = document.createElement("audio");
+          audioEl.id = "audio-fallback-" + targetClientId;
+          audioEl.autoplay = true;
+          (audioEl as any).playsInline = true;
+          document.body.appendChild(audioEl);
+        }
+        audioEl.srcObject = stream;
+        audioEl.volume = 1.0;
+        audioEl.play().catch((err) => console.warn("[WebRTC] Autoplay audio fallback error:", err));
+      }
+
+      if (event.track.kind === "video") {
+        console.log(`[WebRTC] Принят стрим экрана от ${targetClientId}`);
+        setRemoteScreenStream(stream);
+        const p = voicePeersRef.current.find((peer) => peer.clientId === targetClientId);
+        setRemoteSharerName(p ? p.display_name : "Собеседник");
+
+        event.track.onended = () => {
+          setRemoteScreenStream(null);
+          setRemoteSharerName(null);
+        };
+      }
+    };
+
+    // Обмен ICE кандидатами
+    pc.onicecandidate = (event) => {
+      if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "webrtc_signal",
+            targetClientId,
+            signal: { type: "ice", candidate: event.candidate },
+          })
+        );
+      }
+    };
+
+    // Если мы инициатор, создаем оффер
+    if (isInitiator) {
+      startNegotiation(targetClientId, newEntry);
+    }
+
+    return newEntry;
+  };
+
+  // 6. Подключение к WebSocket шлюзу
   useEffect(() => {
     if (!currentUser || !authToken) return;
 
@@ -188,12 +333,13 @@ export default function App() {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log("[WS] Подключение установлено к SquadWave Real-Time Gateway");
+      console.log("[WS] Подключение к SquadWave Gateway успешно");
     };
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
+
         switch (msg.type) {
           case "init":
             myClientIdRef.current = msg.clientId;
@@ -208,21 +354,50 @@ export default function App() {
             }
             break;
 
-          case "voice_room_peers":
-            setVoicePeers(msg.peers || []);
-            break;
-
-          case "voice_peer_joined":
-            setVoicePeers((prev) => {
-              if (prev.some((p) => p.clientId === msg.peer.clientId)) return prev;
-              return [...prev, msg.peer];
+          // Список существующих участников при входе в войс
+          case "voice_room_peers": {
+            const peers: VoicePeer[] = msg.peers || [];
+            setVoicePeers(peers);
+            // Для каждого существующего участника создаем PeerConnection как инициатор
+            peers.forEach((peer) => {
+              getOrCreatePeerConnection(peer.clientId, true);
             });
             break;
+          }
 
-          case "voice_peer_left":
+          // Новый участник зашел в войс
+          case "voice_peer_joined": {
+            const newPeer: VoicePeer = msg.peer;
+            setVoicePeers((prev) => {
+              if (prev.some((p) => p.clientId === newPeer.clientId)) return prev;
+              return [...prev, newPeer];
+            });
+            // Не инициатор: создаем подключение и ждем оффер
+            getOrCreatePeerConnection(newPeer.clientId, false);
+            break;
+          }
+
+          // Участник вышел из войса
+          case "voice_peer_left": {
+            const entry = peerConnectionsRef.current.get(msg.clientId);
+            if (entry) {
+              entry.pc.close();
+              peerConnectionsRef.current.delete(msg.clientId);
+            }
+            const audioEl = document.getElementById("audio-fallback-" + msg.clientId);
+            if (audioEl) audioEl.remove();
+
+            setPeerAudioStreams((prev) => {
+              const next = new Map(prev);
+              next.delete(msg.clientId);
+              return next;
+            });
+
             setVoicePeers((prev) => prev.filter((p) => p.clientId !== msg.clientId));
             break;
+          }
 
+          // Индикация речи
           case "voice_speaking":
             setVoicePeers((prev) =>
               prev.map((p) =>
@@ -232,14 +407,67 @@ export default function App() {
               )
             );
             break;
+
+          // Уведомление о стриме экрана
+          case "screen_share_status":
+            if (!msg.isSharing) {
+              setRemoteScreenStream(null);
+              setRemoteSharerName(null);
+            } else {
+              setRemoteSharerName(msg.sharerName);
+            }
+            break;
+
+          // Обработка сигналов WebRTC (Offer, Answer, ICE)
+          case "webrtc_signal": {
+            const { fromClientId, signal } = msg;
+            const entry = getOrCreatePeerConnection(fromClientId, false);
+            const pc = entry.pc;
+
+            try {
+              if (signal.type === "offer") {
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+
+                // Сбрасываем накопившиеся ICE кандидаты
+                while (entry.pendingCandidates.length > 0) {
+                  const cand = entry.pendingCandidates.shift();
+                  if (cand) await pc.addIceCandidate(new RTCIceCandidate(cand));
+                }
+
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(
+                  JSON.stringify({
+                    type: "webrtc_signal",
+                    targetClientId: fromClientId,
+                    signal: { type: "answer", sdp: answer },
+                  })
+                );
+              } else if (signal.type === "answer") {
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+
+                while (entry.pendingCandidates.length > 0) {
+                  const cand = entry.pendingCandidates.shift();
+                  if (cand) await pc.addIceCandidate(new RTCIceCandidate(cand));
+                }
+              } else if (signal.type === "ice") {
+                if (signal.candidate) {
+                  if (pc.remoteDescription && pc.remoteDescription.type) {
+                    await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+                  } else {
+                    entry.pendingCandidates.push(signal.candidate);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error("[WebRTC] Signal handling error:", err);
+            }
+            break;
+          }
         }
       } catch (e) {
-        console.error("[WS] Ошибка парсинга:", e);
+        console.error("[WS] Ошибка:", e);
       }
-    };
-
-    ws.onclose = () => {
-      console.log("[WS] Соединение закрыто");
     };
 
     return () => {
@@ -247,116 +475,161 @@ export default function App() {
     };
   }, [currentUser, authToken, activeChannel]);
 
-  // 6. Аудиоанализатор и локальная детекция голоса
-  useEffect(() => {
-    if (!isInVoice || !activeVoiceChannel) return;
-
-    let active = true;
-    let animId: number;
-
-    async function startAudio() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: !rnnoiseActive,
-            autoGainControl: true,
-          },
-        });
-        if (!active) return;
-        localStreamRef.current = stream;
-
-        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        audioContextRef.current = ctx;
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64;
-        source.connect(analyser);
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        let wasSpeaking = false;
-
-        const loop = () => {
-          if (!active) return;
-          analyser.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-          const avg = sum / dataArray.length;
-          const speaking = avg > 20 && !isMuted;
-
-          if (speaking !== wasSpeaking && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wasSpeaking = speaking;
-            wsRef.current.send(
-              JSON.stringify({
-                type: "voice_speaking",
-                isSpeaking: speaking,
-                volume: Math.min(100, avg * 2),
-              })
-            );
-          }
-
-          animId = requestAnimationFrame(loop);
-        };
-        loop();
-      } catch (err) {
-        console.warn("Микрофон недоступен:", err);
+  // Анализатор голоса для индикации речи
+  const initAudioAnalyser = (stream: MediaStream) => {
+    try {
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
       }
+
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 64;
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let wasSpeaking = false;
+
+      const loop = () => {
+        if (!audioContextRef.current || ctx.state === "closed") return;
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        const avg = sum / dataArray.length;
+        const speaking = avg > 20 && !isMutedRef.current;
+
+        if (speaking !== wasSpeaking && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wasSpeaking = speaking;
+          wsRef.current.send(
+            JSON.stringify({
+              type: "voice_speaking",
+              isSpeaking: speaking,
+              volume: Math.min(100, Math.round(avg * 2)),
+            })
+          );
+        }
+
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    } catch (e) {
+      console.warn("Audio analyser init error:", e);
     }
+  };
 
-    startAudio();
+  // Управление заглушением микрофона
+  useEffect(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !isMuted));
+    }
+  }, [isMuted]);
 
-    return () => {
-      active = false;
-      if (animId) cancelAnimationFrame(animId);
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (audioContextRef.current) audioContextRef.current.close();
-    };
-  }, [isInVoice, activeVoiceChannel, isMuted, rnnoiseActive]);
+  // Управление наушниками (deafen)
+  useEffect(() => {
+    const audioElements = document.querySelectorAll("audio");
+    audioElements.forEach((el) => {
+      el.muted = isDeafened;
+    });
+  }, [isDeafened]);
 
-  // Вход / регистрация
-  const handleAuthSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError("");
-
-    const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
-    const payload =
-      authMode === "login"
-        ? { username: authUsername, password: authPassword }
-        : { username: authUsername, password: authPassword, display_name: authDisplayName };
+  // ==========================================================
+  // 7. ШЕРИНГ ЭКРАНА (1080p 60 FPS) С ПЕРЕДАЧЕЙ ПО WEBRTC
+  // ==========================================================
+  const toggleScreenShare = async () => {
+    if (isScreenSharing) {
+      stopScreenShare();
+      return;
+    }
 
     try {
-      const res = await fetch(`${API_BASE}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 60 },
+        },
+        audio: false,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setAuthError(data.error || "Ошибка авторизации");
-        return;
+
+      localScreenStreamRef.current = stream;
+      setLocalScreenStream(stream);
+      setIsScreenSharing(true);
+
+      const videoTrack = stream.getVideoTracks()[0];
+
+      // Добавляем видео-трек во все активные соединения и согласуем
+      for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
+        entry.pc.addTrack(videoTrack, stream);
+        startNegotiation(peerId, entry);
       }
 
-      localStorage.setItem("squadwave_token", data.token);
-      setAuthToken(data.token);
-      setCurrentUser(data.user);
-    } catch (e: any) {
-      setAuthError("Не удалось подключиться к серверу SquadWave");
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "screen_share_status", isSharing: true }));
+      }
+
+      videoTrack.onended = () => {
+        stopScreenShare();
+      };
+    } catch (e) {
+      console.warn("Screen share cancelled:", e);
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("squadwave_token");
-    setAuthToken(null);
-    setCurrentUser(null);
-    setIsInVoice(false);
+  const stopScreenShare = () => {
+    if (localScreenStreamRef.current) {
+      localScreenStreamRef.current.getTracks().forEach((t) => t.stop());
+      localScreenStreamRef.current = null;
+    }
+    setLocalScreenStream(null);
+    setIsScreenSharing(false);
+
+    for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
+      entry.pc.getSenders().forEach((sender) => {
+        if (sender.track && sender.track.kind === "video") {
+          try {
+            entry.pc.removeTrack(sender);
+          } catch (e) {}
+        }
+      });
+      startNegotiation(peerId, entry);
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "screen_share_status", isSharing: false }));
+    }
   };
 
-  // Вход в голосовую комнату
-  const joinVoiceChannel = (channel: ChannelItem) => {
+  // Вход / выход из голосового канала
+  const joinVoiceChannel = async (channel: ChannelItem) => {
     setActiveVoiceChannel(channel);
     setIsInVoice(true);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: !rnnoiseActive,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      localStreamRef.current = stream;
+      initAudioAnalyser(stream);
+
+      // Прикрепляем аудио-трек ко всем уже существующим соединениям
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = !isMutedRef.current;
+        for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
+          entry.pc.addTrack(track, stream);
+          startNegotiation(peerId, entry);
+        }
+      });
+    } catch (err) {
+      console.warn("[Media] Микрофон недоступен:", err);
+    }
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "voice_join", channelId: channel.id }));
     }
@@ -366,39 +639,38 @@ export default function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "voice_leave" }));
     }
+
+    // Закрываем все активные PeerConnections
+    for (const entry of peerConnectionsRef.current.values()) {
+      entry.pc.close();
+    }
+    peerConnectionsRef.current.clear();
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+
+    if (isScreenSharing) {
+      stopScreenShare();
+    }
+
+    document.querySelectorAll("[id^='audio-fallback-']").forEach((a) => a.remove());
+
+    setPeerAudioStreams(new Map());
     setIsInVoice(false);
     setActiveVoiceChannel(null);
     setVoicePeers([]);
-    if (isScreenSharing) toggleScreenShare();
+    setRemoteScreenStream(null);
+    setRemoteSharerName(null);
   };
 
-  // Шеринг экрана
-  const toggleScreenShare = async () => {
-    if (isScreenSharing) {
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((t) => t.stop());
-        screenStreamRef.current = null;
-      }
-      if (screenVideoRef.current) screenVideoRef.current.srcObject = null;
-      setIsScreenSharing(false);
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
-        audio: true,
-      });
-      screenStreamRef.current = stream;
-      if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
-      setIsScreenSharing(true);
-      stream.getVideoTracks()[0].onended = () => setIsScreenSharing(false);
-    } catch (e) {
-      console.warn("Screen share cancelled:", e);
-    }
-  };
-
-  // Отправка сообщения
+  // Отправка сообщения чата
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!messageInput.trim() || !activeChannel || !authToken) return;
@@ -470,6 +742,44 @@ export default function App() {
     }
   };
 
+  // Авторизация (вход / регистрация)
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+
+    const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+    const payload =
+      authMode === "login"
+        ? { username: authUsername, password: authPassword }
+        : { username: authUsername, password: authPassword, display_name: authDisplayName };
+
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "Ошибка авторизации");
+        return;
+      }
+
+      localStorage.setItem("squadwave_token", data.token);
+      setAuthToken(data.token);
+      setCurrentUser(data.user);
+    } catch (e: any) {
+      setAuthError("Не удалось подключиться к серверу SquadWave");
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("squadwave_token");
+    setAuthToken(null);
+    setCurrentUser(null);
+    setIsInVoice(false);
+  };
+
   // ==========================================
   // ЭКРАН 1: ВХОД И РЕГИСТРАЦИЯ
   // ==========================================
@@ -499,7 +809,6 @@ export default function App() {
             flexDirection: "column",
           }}
         >
-          {/* Логотип SquadWave */}
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
             <div
               style={{
@@ -527,7 +836,7 @@ export default function App() {
           </h2>
           <p style={{ fontSize: 13, color: "rgba(255, 255, 255, 0.5)", margin: "0 0 24px 0" }}>
             {authMode === "login"
-              ? "Войдите со своим именем пользователя и паролем"
+              ? "Войдите со своим логином и паролем"
               : "Данные сохраняются в защищённую локальную базу SQLite"}
           </p>
 
@@ -551,14 +860,14 @@ export default function App() {
           <form onSubmit={handleAuthSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div>
               <label style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "rgba(255,255,255,0.6)", marginBottom: 6, display: "block" }}>
-                Имя пользователя (Логин)
+                Логин
               </label>
               <input
                 type="text"
                 required
                 value={authUsername}
                 onChange={(e) => setAuthUsername(e.target.value)}
-                placeholder="alex"
+                placeholder="testik"
                 style={{
                   width: "100%",
                   padding: "12px 14px",
@@ -575,13 +884,13 @@ export default function App() {
             {authMode === "register" && (
               <div>
                 <label style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", color: "rgba(255,255,255,0.6)", marginBottom: 6, display: "block" }}>
-                  Отображаемое имя (Никнейм)
+                  Отображаемое имя (Ник)
                 </label>
                 <input
                   type="text"
                   value={authDisplayName}
                   onChange={(e) => setAuthDisplayName(e.target.value)}
-                  placeholder="Александр"
+                  placeholder="testik"
                   style={{
                     width: "100%",
                     padding: "12px 14px",
@@ -631,7 +940,6 @@ export default function App() {
                 fontWeight: 900,
                 fontSize: 15,
                 cursor: "pointer",
-                transition: "opacity 0.2s",
               }}
             >
               {authMode === "login" ? "Войти в систему" : "Зарегистрироваться"}
@@ -704,7 +1012,6 @@ export default function App() {
 
         <div style={{ width: 36, height: 2, background: "rgba(255, 255, 255, 0.1)", margin: "4px 0" }} />
 
-        {/* Список серверов из SQLite */}
         {servers.map((srv) => {
           const isCurrent = activeServer && activeServer.id === srv.id;
           return (
@@ -726,7 +1033,6 @@ export default function App() {
                 fontSize: 16,
                 cursor: "pointer",
                 position: "relative",
-                transition: "all 0.15s ease",
               }}
             >
               {srv.icon || srv.name[0]}
@@ -746,7 +1052,6 @@ export default function App() {
           );
         })}
 
-        {/* Добавить сервер (+) */}
         <div
           onClick={() => setShowCreateServerModal(true)}
           title="Создать новый сервер"
@@ -778,7 +1083,6 @@ export default function App() {
           flexDirection: "column",
         }}
       >
-        {/* Шапка сервера */}
         <div
           style={{
             height: 54,
@@ -789,7 +1093,7 @@ export default function App() {
             justifyContent: "space-between",
           }}
         >
-          <span style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.01em" }}>
+          <span style={{ fontWeight: 800, fontSize: 15 }}>
             {activeServer ? activeServer.name : "Выберите сервер"}
           </span>
           <button
@@ -812,7 +1116,6 @@ export default function App() {
           </button>
         </div>
 
-        {/* Список каналов */}
         <div style={{ flex: 1, padding: "16px 10px", display: "flex", flexDirection: "column", gap: 16, overflowY: "auto" }}>
           {/* Текстовые каналы */}
           <div>
@@ -891,16 +1194,13 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* Если пользователь в этой комнате, показываем список реальных участников */}
                     {isCurrent && (
                       <div style={{ paddingLeft: 26, display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
-                        {/* Локальный пользователь */}
                         <div style={{ fontSize: 12, color: "#bef264", display: "flex", alignItems: "center", gap: 6 }}>
                           <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#bef264" }} />
                           <span>{currentUser.display_name} (Вы)</span>
                           {isMuted && <MicOff size={11} color="#ef4444" />}
                         </div>
-                        {/* Удаленные участники из WebSockets */}
                         {voicePeers.map((p) => (
                           <div key={p.clientId} style={{ fontSize: 12, color: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.6)", display: "flex", alignItems: "center", gap: 6 }}>
                             <div style={{ width: 6, height: 6, borderRadius: "50%", background: p.isSpeaking ? "#bef264" : "rgba(255,255,255,0.2)" }} />
@@ -915,13 +1215,13 @@ export default function App() {
           </div>
         </div>
 
-        {/* Статус WebRTC соединения внизу (если в войсе) */}
+        {/* Панель активного WebRTC войса */}
         {isInVoice && (
           <div style={{ padding: "12px 14px", background: "rgba(0, 0, 0, 0.45)", borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#10b981" }}>
                 <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", boxShadow: "0 0 6px #10b981" }} />
-                <span>SFU ПОДКЛЮЧЕН</span>
+                <span>ГОЛОС ПОДКЛЮЧЕН</span>
               </div>
               <span style={{ fontFamily: "monospace", fontSize: 12, color: "#bef264", fontWeight: 800 }}>{ping} ms</span>
             </div>
@@ -938,7 +1238,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Профиль пользователя */}
+        {/* Профиль */}
         <div
           style={{
             height: 56,
@@ -993,8 +1293,26 @@ export default function App() {
               {isMuted ? <MicOff size={15} /> : <Mic size={15} />}
             </button>
             <button
+              onClick={() => setIsDeafened(!isDeafened)}
+              title={isDeafened ? "Включить звук" : "Заглушить звук"}
+              style={{
+                width: 30,
+                height: 30,
+                borderRadius: 6,
+                background: isDeafened ? "rgba(239, 68, 68, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                border: "none",
+                color: isDeafened ? "#ef4444" : "#ffffff",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+              }}
+            >
+              {isDeafened ? <VolumeX size={15} /> : <Headphones size={15} />}
+            </button>
+            <button
               onClick={handleLogout}
-              title="Выйти из аккаунта"
+              title="Выйти"
               style={{
                 width: 30,
                 height: 30,
@@ -1014,7 +1332,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* 3. ГЛАВНАЯ ОБЛАСТЬ: ЧАТ ИЛИ ГОЛОС */}
+      {/* 3. ГЛАВНАЯ ОБЛАСТЬ: ЧАТ И ГОЛОС */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#090a0f" }}>
         {/* Шапка канала */}
         <div
@@ -1034,7 +1352,6 @@ export default function App() {
             </span>
           </div>
 
-          {/* Панель инструментов: Шумодав, Стрим экрана, Саммари */}
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <button
               onClick={() => setRnnoiseActive(!rnnoiseActive)}
@@ -1100,7 +1417,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Сетка голосовой комнаты (если в войсе) */}
+        {/* Сетка голосовой комнаты */}
         {isInVoice && activeVoiceChannel && (
           <div
             style={{
@@ -1112,24 +1429,77 @@ export default function App() {
               gap: 14,
             }}
           >
-            {/* Видео стрима экрана */}
-            {isScreenSharing && (
+            {/* Реальное воспроизведение звука всех удаленных участников по WebRTC */}
+            {Array.from(peerAudioStreams.entries()).map(([peerId, stream]) => (
+              <audio
+                key={"audio-stream-" + peerId}
+                ref={(el) => {
+                  if (el && el.srcObject !== stream) {
+                    el.srcObject = stream;
+                    el.volume = 1.0;
+                    el.play().catch((e) => console.warn("Peer audio autoplay blocked:", e));
+                  }
+                }}
+                autoPlay
+                playsInline
+              />
+            ))}
+
+            {/* Окно стрима экрана (ЛОКАЛЬНОЕ ИЛИ УДАЛЁННОЕ ОТ ДРУГОГО ПОЛЬЗОВАТЕЛЯ!) */}
+            {(isScreenSharing || remoteScreenStream) && (
               <div
                 style={{
-                  height: 380,
+                  height: 420,
                   background: "#000000",
                   borderRadius: 14,
-                  border: "1px solid rgba(56, 189, 248, 0.4)",
+                  border: "2px solid #38bdf8",
                   overflow: "hidden",
                   display: "flex",
                   flexDirection: "column",
+                  position: "relative",
+                  boxShadow: "0 20px 60px rgba(56, 189, 248, 0.2)",
                 }}
               >
-                <div style={{ padding: "6px 14px", background: "rgba(0,0,0,0.6)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • 8.2 Mbps (Hardware WebRTC)</span>
-                  <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Стрим экрана: {currentUser.display_name}</span>
+                <div style={{ padding: "6px 14px", background: "rgba(0,0,0,0.75)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: "#bef264", fontWeight: 800 }}>LIVE 1080p 60.0 FPS • WebRTC PeerStream</span>
+                  <span style={{ fontSize: 11, color: "#ffffff", fontWeight: 700 }}>
+                    📺 Стрим экрана: {isScreenSharing ? `${currentUser.display_name} (Вы)` : remoteSharerName || "Участник"}
+                  </span>
                 </div>
-                <video ref={screenVideoRef} autoPlay playsInline muted style={{ flex: 1, width: "100%", height: "100%", objectFit: "contain" }} />
+
+                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#05070a", position: "relative" }}>
+                  {isScreenSharing && localScreenStream && (
+                    <video
+                      ref={(el) => {
+                        if (el && el.srcObject !== localScreenStream) {
+                          el.srcObject = localScreenStream;
+                          el.play().catch(console.warn);
+                        }
+                      }}
+                      autoPlay
+                      playsInline
+                      muted
+                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                    />
+                  )}
+                  {!isScreenSharing && remoteScreenStream && (
+                    <video
+                      ref={(el) => {
+                        if (el && el.srcObject !== remoteScreenStream) {
+                          el.srcObject = remoteScreenStream;
+                          el.play().catch((err) => {
+                            console.warn("[WebRTC Video] Fallback to muted playback:", err);
+                            el.muted = true;
+                            el.play().catch(console.warn);
+                          });
+                        }
+                      }}
+                      autoPlay
+                      playsInline
+                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                    />
+                  )}
+                </div>
               </div>
             )}
 
@@ -1142,7 +1512,7 @@ export default function App() {
                   padding: 16,
                   borderRadius: 14,
                   background: "rgba(255, 255, 255, 0.03)",
-                  border: "1px solid rgba(190, 242, 100, 0.3)",
+                  border: isMuted ? "1px solid rgba(255, 255, 255, 0.08)" : "1px solid rgba(190, 242, 100, 0.4)",
                   display: "flex",
                   flexDirection: "column",
                   alignItems: "center",
@@ -1152,13 +1522,13 @@ export default function App() {
               >
                 <div
                   style={{
-                    width: 54,
-                    height: 54,
+                    width: 58,
+                    height: 58,
                     borderRadius: "50%",
                     background: currentUser.avatar_color,
                     color: "#090a0f",
                     fontWeight: 900,
-                    fontSize: 22,
+                    fontSize: 24,
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
@@ -1167,10 +1537,12 @@ export default function App() {
                   {currentUser.display_name[0].toUpperCase()}
                 </div>
                 <div style={{ fontSize: 13, fontWeight: 700 }}>{currentUser.display_name} (Вы)</div>
-                <div style={{ fontSize: 11, color: "#bef264" }}>{isMuted ? "Микрофон выкл" : "В сети"}</div>
+                <div style={{ fontSize: 11, color: isMuted ? "#ef4444" : "#bef264" }}>
+                  {isMuted ? "Микрофон выкл" : "В сети"}
+                </div>
               </div>
 
-              {/* Удаленные участники комнаты */}
+              {/* Удаленные участники (светятся при речи и воспроизводят звук!) */}
               {voicePeers.map((peer) => (
                 <div
                   key={peer.clientId}
@@ -1180,33 +1552,35 @@ export default function App() {
                     borderRadius: 14,
                     background: "rgba(255, 255, 255, 0.03)",
                     border: peer.isSpeaking ? `2px solid ${peer.avatar_color}` : "1px solid rgba(255, 255, 255, 0.08)",
-                    boxShadow: peer.isSpeaking ? `0 0 20px ${peer.avatar_color}40` : "none",
+                    boxShadow: peer.isSpeaking ? `0 0 25px ${peer.avatar_color}50` : "none",
                     display: "flex",
                     flexDirection: "column",
                     alignItems: "center",
                     justifyContent: "center",
                     gap: 8,
+                    transition: "all 0.15s ease",
                   }}
                 >
                   <div
                     style={{
-                      width: 54,
-                      height: 54,
+                      width: 58,
+                      height: 58,
                       borderRadius: "50%",
                       background: peer.avatar_color,
                       color: "#090a0f",
                       fontWeight: 900,
-                      fontSize: 22,
+                      fontSize: 24,
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
+                      boxShadow: peer.isSpeaking ? `0 0 20px ${peer.avatar_color}` : "none",
                     }}
                   >
                     {peer.display_name[0].toUpperCase()}
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 700 }}>{peer.display_name}</div>
                   <div style={{ fontSize: 11, color: peer.isSpeaking ? "#bef264" : "rgba(255,255,255,0.4)" }}>
-                    {peer.isSpeaking ? "Говорит" : "Слушает"}
+                    {peer.isSpeaking ? "Говорит 🔊" : "Слушает"}
                   </div>
                 </div>
               ))}
@@ -1214,12 +1588,12 @@ export default function App() {
           </div>
         )}
 
-        {/* Текстовые сообщения реального канала */}
+        {/* Текстовые сообщения */}
         <div style={{ flex: 1, padding: "20px 24px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {messages.length === 0 ? (
             <div style={{ margin: "auto", textAlign: "center", color: "rgba(255,255,255,0.3)" }}>
               <MessageSquare size={36} style={{ marginBottom: 10, opacity: 0.5 }} />
-              <div>Здесь пока нет сообщений в #{activeChannel?.name}.</div>
+              <div>В канале #{activeChannel?.name} пока нет сообщений.</div>
               <div style={{ fontSize: 12, marginTop: 4 }}>Напишите первое сообщение ниже!</div>
             </div>
           ) : (
