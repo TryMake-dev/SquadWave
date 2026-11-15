@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+build/
+*.exe
+sfu-server
+
+# Logs & temp
+*.log
+.DS_Store
+.env.local

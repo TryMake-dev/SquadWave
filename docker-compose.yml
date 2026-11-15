@@ -5,7 +5,7 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
-    container_name: squad-sfu
+    container_name: squadwave-sfu
     restart: always
     ports:
       - "8443:8443"
@@ -18,7 +18,7 @@ services:
 
   coturn:
     image: coturn/coturn:latest
-    container_name: squad-turn
+    container_name: squadwave-turn
     restart: always
     ports:
       - "3478:3478"
@@ -27,6 +27,17 @@ services:
       - TURN_USERNAME=squad
       - TURN_PASSWORD=webrtc2026
       - TURN_REALM=squad-voice.internal
+    networks:
+      - squad-net
+
+  web-client:
+    image: nginx:alpine
+    container_name: squadwave-web
+    restart: always
+    ports:
+      - "3000:80"
+    volumes:
+      - ./web/dist:/usr/share/nginx/html:ro
     networks:
       - squad-net
 
