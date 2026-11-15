@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { NeuralAudioProcessor } from "./audio/rnnoiseManager";
 import {
   Mic,
   MicOff,
@@ -10,6 +11,7 @@ import {
   PhoneOff,
   Radio,
   Settings,
+  SlidersHorizontal,
   Hash,
   Volume2 as VolumeIcon,
   Sparkles,
@@ -124,11 +126,27 @@ export default function App() {
   const playbackAudioCtxRef = useRef<AudioContext | null>(null);
   const nextPcmPlayTimeRef = useRef<number>(0);
   const screenCaptureIntervalRef = useRef<any>(null);
-  const [rnnoiseActive, setRnnoiseActive] = useState(true);
-  const rnnoiseActiveRef = useRef(true);
+  const [rnnoiseActive, setRnnoiseActive] = useState(() => localStorage.getItem("squadwave_rnnoise") !== "false");
+  const rnnoiseActiveRef = useRef(rnnoiseActive);
   rnnoiseActiveRef.current = rnnoiseActive;
+
+  const [vadThreshold, setVadThreshold] = useState<number>(() => {
+    const s = localStorage.getItem("squadwave_vad_threshold");
+    return s ? parseFloat(s) : 0.65;
+  });
+  const vadThresholdRef = useRef(vadThreshold);
+  vadThresholdRef.current = vadThreshold;
+
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>("");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>(() => {
+    return localStorage.getItem("squadwave_mic_device") || "";
+  });
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [micTestVolume, setMicTestVolume] = useState(0);
+
+  const neuralProcessorRef = useRef<NeuralAudioProcessor | null>(null);
+  const processedStreamRef = useRef<MediaStream | null>(null);
+  const captureVideoRef = useRef<HTMLVideoElement | null>(null);
   const [ping, setPing] = useState(18);
 
   // Модальные окна
@@ -160,7 +178,10 @@ export default function App() {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const inputs = devices.filter((d) => d.kind === "audioinput");
       setAudioDevices(inputs);
-      if (inputs.length > 0 && !selectedAudioDeviceId) {
+      const saved = localStorage.getItem("squadwave_mic_device");
+      if (saved && inputs.some((d) => d.deviceId === saved)) {
+        setSelectedAudioDeviceId(saved);
+      } else if (inputs.length > 0 && !selectedAudioDeviceId) {
         setSelectedAudioDeviceId(inputs[0].deviceId);
       }
     } catch (err) {
@@ -178,6 +199,7 @@ export default function App() {
 
   const handleAudioDeviceChange = async (newDeviceId: string) => {
     setSelectedAudioDeviceId(newDeviceId);
+    localStorage.setItem("squadwave_mic_device", newDeviceId);
     if (isInVoice) {
       await startAudioCapture(newDeviceId);
     }
@@ -318,11 +340,12 @@ export default function App() {
       }
     };
 
-    // Прикрепляем локальный аудио-трек микрофона если есть
-    if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach((track) => {
+    // Прикрепляем локальный аудио-трек микрофона (с нейросетевым шумоподавлением RNNoise)
+    const outgoingStream = processedStreamRef.current || localStreamRef.current;
+    if (outgoingStream) {
+      outgoingStream.getAudioTracks().forEach((track) => {
         track.enabled = !isMutedRef.current;
-        pc.addTrack(track, localStreamRef.current!);
+        pc.addTrack(track, outgoingStream);
       });
     }
 
@@ -662,7 +685,7 @@ export default function App() {
     };
   }, [currentUser?.id, authToken]);
 
-  // Захват микрофона с выбором устройства и профессиональным DSP шумоподавлением
+  // Захват микрофона с выбором устройства и нейросетевым шумоподавлением RNNoise (Krisp / Nvidia Broadcast)
   const startAudioCapture = async (deviceId?: string) => {
     try {
       const targetDeviceId = deviceId || selectedAudioDeviceId;
@@ -670,7 +693,7 @@ export default function App() {
         audio: {
           deviceId: targetDeviceId ? { exact: targetDeviceId } : undefined,
           echoCancellation: true,
-          noiseSuppression: true,
+          noiseSuppression: false, // Отключаем примитивный шумодав браузера, чтобы RNNoise получал полный спектр
           autoGainControl: true,
           channelCount: 1,
           sampleRate: 48000,
@@ -684,8 +707,18 @@ export default function App() {
       if (audioContextRef.current && audioContextRef.current.state !== "closed") {
         audioContextRef.current.close().catch(() => {});
       }
+      if (neuralProcessorRef.current) {
+        neuralProcessorRef.current.destroy();
+        neuralProcessorRef.current = null;
+      }
 
-      // Web Audio API DSP процессинг: обрезка клавиатуры, низкочастотного гула и гейт
+      // Инициализируем нейросетевой процессор RNNoise (GRU)
+      const processor = new NeuralAudioProcessor();
+      processor.rnnoiseEnabled = rnnoiseActiveRef.current;
+      processor.vadThreshold = vadThresholdRef.current;
+      await processor.init();
+      neuralProcessorRef.current = processor;
+
       try {
         const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
         audioContextRef.current = ctx;
@@ -694,128 +727,102 @@ export default function App() {
         }
         const source = ctx.createMediaStreamSource(stream);
 
-        // 1. Highpass: срез саб-басового гула и вибраций стола (< 85 Гц)
+        // 1. Highpass: срез саб-басового гула и вибраций стола (< 75 Гц)
         const highpass = ctx.createBiquadFilter();
         highpass.type = "highpass";
-        highpass.frequency.value = 85;
+        highpass.frequency.value = 75;
 
-        // 2. Notch/Peaking: срез частоты щелчков механической клавиатуры (~3200 Гц)
-        const notch = ctx.createBiquadFilter();
-        notch.type = "peaking";
-        notch.frequency.value = 3200;
-        notch.Q.value = 1.8;
-        notch.gain.value = rnnoiseActiveRef.current ? -14 : 0;
-
-        // 3. Compressor: выравнивание пиков громкости
+        // 2. Dynamics Compressor для естественного выравнивания громкости
         const compressor = ctx.createDynamicsCompressor();
-        compressor.threshold.value = -24;
-        compressor.knee.value = 15;
-        compressor.ratio.value = 5;
+        compressor.threshold.value = -18;
+        compressor.knee.value = 12;
+        compressor.ratio.value = 3;
         compressor.attack.value = 0.003;
-        compressor.release.value = 0.2;
+        compressor.release.value = 0.15;
 
         source.connect(highpass);
-        highpass.connect(notch);
-        notch.connect(compressor);
+        highpass.connect(compressor);
 
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64;
-        compressor.connect(analyser);
+        // Создаем MediaStreamDestination для передачи нейросетевого очищенного звука в WebRTC
+        const destination = ctx.createMediaStreamDestination();
+        processedStreamRef.current = destination.stream;
 
-        // Изолируем PCM процессор через нулевой Gain (исключает самовозбуждение и эхо в динамики)
-        const pcmProcessor = ctx.createScriptProcessor(2048, 1, 1);
+        // ScriptProcessor: 1024 сэмпла (~21мс латентность)
+        const pcmProcessor = ctx.createScriptProcessor(1024, 1, 1);
         compressor.connect(pcmProcessor);
+        pcmProcessor.connect(destination);
 
+        // Zero-gain dummy нода к ctx.destination (гарантирует активность процессора без эха в наушниках)
         const dummyGain = ctx.createGain();
         dummyGain.gain.value = 0;
         pcmProcessor.connect(dummyGain);
         dummyGain.connect(ctx.destination);
 
-        let gateHoldFrames = 0;
         pcmProcessor.onaudioprocess = (e) => {
-          if (isMutedRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-          const inputData = e.inputBuffer.getChannelData(0);
+          const inData = e.inputBuffer.getChannelData(0);
+          const outData = e.outputBuffer.getChannelData(0);
 
-          let sumSq = 0;
-          for (let i = 0; i < inputData.length; i++) sumSq += inputData[i] * inputData[i];
-          const rms = Math.sqrt(sumSq / inputData.length);
-
-          // Умный гейт: при включенном RNNoise порог 0.010 (полностью отсекает клавиатуру и фоновый шум)
-          const gateThreshold = rnnoiseActiveRef.current ? 0.010 : 0.003;
-          if (rms > gateThreshold) {
-            gateHoldFrames = 8; // удержание ~340мс
-          } else if (gateHoldFrames > 0) {
-            gateHoldFrames--;
-          }
-
-          if (gateHoldFrames <= 0) return; // Гейт закрыт: тишина, клики клавиатуры не передаются!
-
-          // Сглаженный антиалиасинг даунсемплинг до 24кГц
-          const downsampled = new Int16Array(Math.floor(inputData.length / 2));
-          for (let i = 0; i < downsampled.length; i++) {
-            const avgSample = (inputData[i * 2] + inputData[i * 2 + 1]) * 0.5;
-            const s = Math.max(-1, Math.min(1, avgSample));
-            downsampled[i] = Math.round(s * 32767);
-          }
-
-          wsRef.current.send(
-            JSON.stringify({
-              type: "voice_pcm",
-              pcm: Array.from(downsampled),
-            })
-          );
-        };
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        let speakingFrames = 0;
-        let wasSpeaking = false;
-
-        const vadInterval = setInterval(() => {
-          if (!audioContextRef.current || ctx.state === "closed") {
-            clearInterval(vadInterval);
-            return;
-          }
-
-          if (isMutedRef.current) {
-            if (wasSpeaking) {
-              wasSpeaking = false;
-              setIsSelfSpeaking(false);
-              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ type: "voice_speaking", isSpeaking: false, volume: 0 }));
+          if (neuralProcessorRef.current) {
+            neuralProcessorRef.current.rnnoiseEnabled = rnnoiseActiveRef.current;
+            neuralProcessorRef.current.vadThreshold = vadThresholdRef.current;
+            neuralProcessorRef.current.process(
+              inData,
+              outData,
+              isMutedRef.current,
+              (isSpeaking, volume) => {
+                setIsSelfSpeaking(isSpeaking);
+                setMicTestVolume(volume);
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(
+                    JSON.stringify({
+                      type: "voice_speaking",
+                      isSpeaking,
+                      volume,
+                    })
+                  );
+                }
               }
-            }
-            return;
+            );
+          } else {
+            outData.set(inData);
           }
 
-          analyser.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-          const avg = sum / dataArray.length;
+          // Гарантированная доставка звука через WebSocket Gateway при блокировках UDP/VPN
+          if (!isMutedRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            let sumSq = 0;
+            for (let i = 0; i < outData.length; i++) sumSq += outData[i] * outData[i];
+            const rms = Math.sqrt(sumSq / outData.length);
 
-          const vadThreshold = rnnoiseActiveRef.current ? 9 : 5;
-          if (avg > vadThreshold) {
-            speakingFrames = 10;
-          } else if (speakingFrames > 0) {
-            speakingFrames--;
-          }
+            if (rms > 0.00005 || (neuralProcessorRef.current?.vadHangover ?? 0) > 0) {
+              const downsampled = new Int16Array(Math.floor(outData.length / 2));
+              for (let i = 0; i < downsampled.length; i++) {
+                const avg = (outData[i * 2] + outData[i * 2 + 1]) * 0.5;
+                const clamped = Math.max(-1.0, Math.min(1.0, avg));
+                downsampled[i] = Math.round(clamped * 32767);
+              }
 
-          const isSpeaking = speakingFrames > 0;
-          if (isSpeaking !== wasSpeaking) {
-            wasSpeaking = isSpeaking;
-            setIsSelfSpeaking(isSpeaking);
-            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               wsRef.current.send(
                 JSON.stringify({
-                  type: "voice_speaking",
-                  isSpeaking,
-                  volume: Math.min(100, Math.round(avg * 2)),
+                  type: "voice_pcm",
+                  pcm: Array.from(downsampled),
                 })
               );
             }
           }
-        }, 60);
+        };
       } catch (err) {
-        console.warn("Audio analyser error:", err);
+        console.warn("Audio processing setup error:", err);
+      }
+
+      // Обновляем аудио-трек на очищенный для всех активных WebRTC соединений
+      const outgoingAudioTrack = (processedStreamRef.current || stream).getAudioTracks()[0];
+      if (outgoingAudioTrack) {
+        for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
+          const audioSender = entry.pc.getSenders().find((s) => s.track && s.track.kind === "audio");
+          if (audioSender) {
+            audioSender.replaceTrack(outgoingAudioTrack).catch(console.warn);
+          }
+        }
       }
 
       return stream;
@@ -833,6 +840,9 @@ export default function App() {
 
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !nextMuted));
+    }
+    if (processedStreamRef.current) {
+      processedStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = !nextMuted));
     }
 
     if (nextMuted) {
@@ -922,6 +932,16 @@ export default function App() {
       captureVideo.srcObject = stream;
       captureVideo.muted = true;
       captureVideo.playsInline = true;
+      captureVideo.autoplay = true;
+      captureVideo.style.position = "fixed";
+      captureVideo.style.top = "-9999px";
+      captureVideo.style.left = "-9999px";
+      captureVideo.style.width = "10px";
+      captureVideo.style.height = "10px";
+      captureVideo.style.opacity = "0";
+      captureVideo.style.pointerEvents = "none";
+      document.body.appendChild(captureVideo);
+      captureVideoRef.current = captureVideo;
       captureVideo.play().catch(() => {});
 
       const captureCanvas = document.createElement("canvas");
@@ -937,7 +957,7 @@ export default function App() {
         }
         if (ctx2d && captureVideo.readyState >= 2) {
           ctx2d.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
-          const frameData = captureCanvas.toDataURL("image/jpeg", 0.65);
+          const frameData = captureCanvas.toDataURL("image/jpeg", 0.60);
           wsRef.current.send(
             JSON.stringify({
               type: "screen_frame",
@@ -945,7 +965,7 @@ export default function App() {
             })
           );
         }
-      }, 50);
+      }, 66);
 
       videoTrack.onended = () => {
         stopScreenShare();
@@ -959,6 +979,12 @@ export default function App() {
     if (screenCaptureIntervalRef.current) {
       clearInterval(screenCaptureIntervalRef.current);
       screenCaptureIntervalRef.current = null;
+    }
+    if (captureVideoRef.current) {
+      captureVideoRef.current.pause();
+      captureVideoRef.current.srcObject = null;
+      captureVideoRef.current.remove();
+      captureVideoRef.current = null;
     }
     setLiveScreenFrame(null);
 
@@ -991,11 +1017,12 @@ export default function App() {
     setIsInVoice(true);
 
     const stream = await startAudioCapture();
-    if (stream) {
-      stream.getAudioTracks().forEach((track) => {
+    const outgoingStream = processedStreamRef.current || stream;
+    if (outgoingStream) {
+      outgoingStream.getAudioTracks().forEach((track) => {
         track.enabled = !isMutedRef.current;
         for (const [peerId, entry] of peerConnectionsRef.current.entries()) {
-          entry.pc.addTrack(track, stream);
+          entry.pc.addTrack(track, outgoingStream);
           startNegotiation(peerId, entry);
         }
       });
@@ -1016,6 +1043,16 @@ export default function App() {
       entry.pc.close();
     }
     peerConnectionsRef.current.clear();
+
+    if (neuralProcessorRef.current) {
+      neuralProcessorRef.current.destroy();
+      neuralProcessorRef.current = null;
+    }
+
+    if (processedStreamRef.current) {
+      processedStreamRef.current.getTracks().forEach((t) => t.stop());
+      processedStreamRef.current = null;
+    }
 
     if (localStreamRef.current) {
       if ((localStreamRef.current as any)._raw) {
@@ -1718,6 +1755,24 @@ export default function App() {
               {isDeafened ? <VolumeX size={15} /> : <Headphones size={15} />}
             </button>
             <button
+              onClick={() => setShowSettingsModal(true)}
+              title="Настройки звука и микрофона"
+              style={{
+                width: 30,
+                height: 30,
+                borderRadius: 6,
+                background: "rgba(255, 255, 255, 0.05)",
+                border: "none",
+                color: "rgba(255, 255, 255, 0.7)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+              }}
+            >
+              <Settings size={15} />
+            </button>
+            <button
               onClick={handleLogout}
               title="Выйти"
               style={{
@@ -1838,6 +1893,10 @@ export default function App() {
                 const next = !rnnoiseActive;
                 setRnnoiseActive(next);
                 rnnoiseActiveRef.current = next;
+                localStorage.setItem("squadwave_rnnoise", String(next));
+                if (neuralProcessorRef.current) {
+                  neuralProcessorRef.current.rnnoiseEnabled = next;
+                }
               }}
               style={{
                 display: "flex",
@@ -1845,16 +1904,38 @@ export default function App() {
                 gap: 6,
                 padding: "6px 14px",
                 borderRadius: 8,
-                background: rnnoiseActive ? "rgba(56, 189, 248, 0.15)" : "rgba(255, 255, 255, 0.05)",
-                border: rnnoiseActive ? "1px solid #38bdf8" : "1px solid rgba(255, 255, 255, 0.1)",
-                color: rnnoiseActive ? "#38bdf8" : "rgba(255, 255, 255, 0.5)",
+                background: rnnoiseActive ? "rgba(190, 242, 100, 0.15)" : "rgba(255, 255, 255, 0.05)",
+                border: rnnoiseActive ? "1px solid #bef264" : "1px solid rgba(255, 255, 255, 0.1)",
+                color: rnnoiseActive ? "#bef264" : "rgba(255, 255, 255, 0.5)",
                 fontSize: 12,
                 fontWeight: 700,
                 cursor: "pointer",
               }}
+              title="Нейросетевое шумоподавление RNNoise (Krisp / Nvidia Broadcast)"
             >
-              <Radio size={14} />
-              <span>RNNoise: {rnnoiseActive ? "ВКЛ (-28dB)" : "ВЫКЛ"}</span>
+              <Sparkles size={14} color={rnnoiseActive ? "#bef264" : "rgba(255,255,255,0.4)"} />
+              <span>RNNoise AI: {rnnoiseActive ? "ВКЛ (Krisp / Neural)" : "ВЫКЛ"}</span>
+            </button>
+
+            <button
+              onClick={() => setShowSettingsModal(true)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "6px 12px",
+                borderRadius: 8,
+                background: "rgba(255, 255, 255, 0.05)",
+                border: "1px solid rgba(255, 255, 255, 0.1)",
+                color: "rgba(255, 255, 255, 0.8)",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+              title="Настройки микрофона и шумоподавления"
+            >
+              <SlidersHorizontal size={14} />
+              <span>Звук</span>
             </button>
 
             {isInVoice && (
@@ -2304,6 +2385,198 @@ export default function App() {
               • <strong>Шумодав:</strong> RNNoise Recurrent Neural Network активен локально в браузере<br />
               • <strong>База данных:</strong> SQLite хранит пользователей, каналы и историю сообщений
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* МОДАЛКА: НАСТРОЙКИ ЗВУКА И ВИДЕО (DISCORD & NVIDIA BROADCAST STYLE) */}
+      {showSettingsModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div style={{ width: 560, background: "#0e111a", borderRadius: 18, border: "1px solid rgba(255,255,255,0.12)", padding: 26, boxShadow: "0 25px 60px rgba(0,0,0,0.6)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 34, height: 34, borderRadius: 10, background: "rgba(190, 242, 100, 0.15)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <Settings size={18} color="#bef264" />
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#fff" }}>Настройки звука и микрофона</h3>
+                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.4)" }}>SquadWave Audio Engine • RNNoise Neural Network</div>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowSettingsModal(false)}
+                style={{ background: "transparent", border: "none", color: "rgba(255,255,255,0.5)", cursor: "pointer", padding: 4 }}
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* 1. ВЫБОР МИКРОФОНА */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ display: "block", fontSize: 12, fontWeight: 800, color: "rgba(255,255,255,0.6)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+                Устройство ввода (Микрофон)
+              </label>
+              <div style={{ display: "flex", gap: 10 }}>
+                <div style={{ flex: 1, position: "relative" }}>
+                  <select
+                    value={selectedAudioDeviceId}
+                    onChange={(e) => handleAudioDeviceChange(e.target.value)}
+                    style={{
+                      width: "100%",
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "rgba(255,255,255,0.06)",
+                      border: "1px solid rgba(255,255,255,0.15)",
+                      color: "#fff",
+                      fontSize: 13,
+                      fontWeight: 600,
+                      outline: "none",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {audioDevices.length === 0 ? (
+                      <option value="" style={{ background: "#0e111a", color: "#fff" }}>Микрофон по умолчанию (Системный)</option>
+                    ) : (
+                      audioDevices.map((d, idx) => (
+                        <option key={d.deviceId || idx} value={d.deviceId} style={{ background: "#0e111a", color: "#fff" }}>
+                          {d.label || `Микрофон ${idx + 1}`}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+                <button
+                  onClick={refreshAudioDevices}
+                  style={{
+                    padding: "0 14px",
+                    borderRadius: 10,
+                    background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.15)",
+                    color: "rgba(255,255,255,0.8)",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                  title="Обновить список устройств"
+                >
+                  Обновить
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 6 }}>
+                💡 Браузер запрашивает доступ к микрофонам ПК. Вы можете переключать гарнитуры, USB-микрофоны и веб-камеры на лету без перезагрузки.
+              </div>
+            </div>
+
+            {/* 2. ПРОВЕРКА МИКРОФОНА И ГРОМКОСТИ */}
+            <div style={{ marginBottom: 22, padding: 14, background: "rgba(255,255,255,0.03)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: "rgba(255,255,255,0.8)" }}>Индикатор входного сигнала</span>
+                <span style={{ fontSize: 11, color: isSelfSpeaking ? "#bef264" : "rgba(255,255,255,0.4)", fontWeight: 700 }}>
+                  {isSelfSpeaking ? "Голос обнаружен (VAD Активен)" : "Тишина / Шумодав закрыт"}
+                </span>
+              </div>
+              <div style={{ height: 10, background: "rgba(255,255,255,0.08)", borderRadius: 5, overflow: "hidden", position: "relative" }}>
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${Math.min(100, Math.max(isSelfSpeaking ? 25 : 0, micTestVolume))}%`,
+                    background: isSelfSpeaking ? "linear-gradient(90deg, #bef264, #22c55e)" : "rgba(255,255,255,0.2)",
+                    borderRadius: 5,
+                    transition: "width 0.08s ease-out",
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* 3. НЕЙРОСЕТЕВОЕ ШУМОПОДАВЛЕНИЕ (RNNOISE & KRISP) */}
+            <div style={{ marginBottom: 20, padding: 14, background: "rgba(190, 242, 100, 0.05)", borderRadius: 12, border: "1px solid rgba(190, 242, 100, 0.2)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <Sparkles size={16} color="#bef264" />
+                    <span style={{ fontSize: 13, fontWeight: 800, color: "#fff" }}>AI Шумоподавление (RNNoise / Krisp)</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginTop: 4 }}>
+                    Глубокая нейросеть (GRU RNN). Полностью удаляет стук клавиш, клики мыши, шум кулеров и фон.
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    const next = !rnnoiseActive;
+                    setRnnoiseActive(next);
+                    rnnoiseActiveRef.current = next;
+                    localStorage.setItem("squadwave_rnnoise", String(next));
+                    if (neuralProcessorRef.current) {
+                      neuralProcessorRef.current.rnnoiseEnabled = next;
+                    }
+                  }}
+                  style={{
+                    padding: "7px 16px",
+                    borderRadius: 8,
+                    background: rnnoiseActive ? "#bef264" : "rgba(255,255,255,0.1)",
+                    border: "none",
+                    color: rnnoiseActive ? "#000" : "#fff",
+                    fontWeight: 800,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {rnnoiseActive ? "ВКЛЮЧЕНО" : "ВЫКЛЮЧЕНО"}
+                </button>
+              </div>
+            </div>
+
+            {/* 4. ЧУВСТВИТЕЛЬНОСТЬ VAD (ПОРОГ АКТИВАЦИИ РЕЧИ) */}
+            <div style={{ marginBottom: 22 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <label style={{ fontSize: 12, fontWeight: 800, color: "rgba(255,255,255,0.6)", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                  Чувствительность нейросети (VAD Порог)
+                </label>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#bef264" }}>
+                  {Math.round(vadThreshold * 100)}%
+                </span>
+              </div>
+              <input
+                type="range"
+                min="0.30"
+                max="0.90"
+                step="0.05"
+                value={vadThreshold}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  setVadThreshold(val);
+                  vadThresholdRef.current = val;
+                  localStorage.setItem("squadwave_vad_threshold", String(val));
+                  if (neuralProcessorRef.current) {
+                    neuralProcessorRef.current.vadThreshold = val;
+                  }
+                }}
+                style={{ width: "100%", accentColor: "#bef264", cursor: "pointer" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(255,255,255,0.4)", marginTop: 4 }}>
+                <span>30% (Чувствительный)</span>
+                <span>65% (Оптимально для механических клавиатур)</span>
+                <span>90% (Строгий гейт)</span>
+              </div>
+            </div>
+
+            {/* Кнопка закрытия */}
+            <button
+              onClick={() => setShowSettingsModal(false)}
+              style={{
+                width: "100%",
+                padding: "11px",
+                borderRadius: 10,
+                background: "#bef264",
+                border: "none",
+                color: "#000",
+                fontSize: 13,
+                fontWeight: 800,
+                cursor: "pointer",
+              }}
+            >
+              Готово
+            </button>
           </div>
         </div>
       )}
